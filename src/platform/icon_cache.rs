@@ -42,7 +42,9 @@ impl IconSource {
             Self::Executable(path) => format!("exe:{}", path_identity(path)),
             Self::Shortcut(path) => format!("lnk:{}", path_identity(path)),
             Self::Folder(path) => format!("dir:{}", path_identity(path)),
-            Self::WindowsApp { app_user_model_id } => format!("app:{app_user_model_id}"),
+            Self::WindowsApp { app_user_model_id } => {
+                format!("app:{}", app_user_model_id.to_ascii_lowercase())
+            }
             Self::Indexed {
                 source,
                 resource_index,
@@ -73,8 +75,16 @@ impl IconSource {
 
     fn source_path(&self) -> Option<&Path> {
         match self.base_source() {
-            Self::Executable(path) | Self::Shortcut(path) | Self::Folder(path) => Some(path),
-            Self::WindowsApp { .. } | Self::Indexed { .. } => None,
+            Self::Executable(path) | Self::Shortcut(path) | Self::Folder(path)
+                if !is_shell_namespace_target(path) =>
+            {
+                Some(path)
+            }
+            Self::Executable(_)
+            | Self::Shortcut(_)
+            | Self::Folder(_)
+            | Self::WindowsApp { .. }
+            | Self::Indexed { .. } => None,
         }
     }
 }
@@ -253,6 +263,12 @@ pub fn rebuild_group_cache<E: IconExtractor>(
         .collect()
 }
 
+fn is_shell_namespace_target(path: &Path) -> bool {
+    path.to_string_lossy()
+        .get(..17)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("shell:AppsFolder\\"))
+}
+
 fn path_identity(path: &Path) -> String {
     let normalized = path
         .to_string_lossy()
@@ -410,45 +426,65 @@ mod windows {
             }
         }
 
-        let target = match base {
-            IconSource::WindowsApp { app_user_model_id } => {
-                format!("shell:AppsFolder\\{app_user_model_id}")
+        let targets = target_candidates(base)?;
+        let mut failures = Vec::with_capacity(targets.len());
+        let icon = targets.iter().find_map(|target| {
+            let result = if let Some(index) = source.resource_index() {
+                unsafe { indexed_icon(target, index) }
+            } else {
+                unsafe { shell_icon(target) }
+            };
+            if result.is_none() {
+                failures.push(target.as_str());
             }
-            _ => base
-                .source_path()
-                .ok_or_else(|| IconCacheError::InvalidSource("no Windows target".into()))?
-                .to_string_lossy()
-                .into_owned(),
-        };
-        let icon = if let Some(index) = source.resource_index() {
-            unsafe { indexed_icon(&target, index) }
-        } else {
-            unsafe { shell_icon(&target) }.or_else(|| {
-                // Some registered apps expose their manifest logo through the
-                // AUMID parser name but not through AppsFolder enumeration.
-                if let IconSource::WindowsApp { app_user_model_id } = base {
-                    let fallback = app_user_model_id.clone();
-                    unsafe { shell_icon(&fallback) }
-                } else {
-                    None
-                }
-            })
-        };
+            result
+        });
         let icon = icon.ok_or_else(|| IconCacheError::Extraction {
-            source: target.clone(),
-            message: "shell and manifest-logo lookup returned no icon".into(),
+            source: targets.join(" -> "),
+            message: format!("no shell icon was returned for any candidate: {failures:?}"),
         })?;
         let bytes = unsafe { icon_to_ico(icon) };
         unsafe { DestroyIcon(icon) };
         bytes
             .map_err(|message| IconCacheError::Extraction {
-                source: target,
+                source: targets.join(" -> "),
                 message,
             })
             .map(|bytes| {
                 let _ = preserved_ico_sizes(size);
                 bytes
             })
+    }
+
+    fn target_candidates(base: &IconSource) -> Result<Vec<String>, IconCacheError> {
+        match base {
+            IconSource::WindowsApp { app_user_model_id } => {
+                if app_user_model_id.is_empty() {
+                    return Err(IconCacheError::InvalidSource("empty AUMID".into()));
+                }
+                Ok(vec![
+                    format!("shell:AppsFolder\\{app_user_model_id}"),
+                    app_user_model_id.clone(),
+                ])
+            }
+            IconSource::Executable(path) | IconSource::Shortcut(path)
+                if is_shell_namespace_target(path) =>
+            {
+                let target = path.to_string_lossy().into_owned();
+                let aumid = target[17..].to_owned();
+                if aumid.is_empty() {
+                    return Err(IconCacheError::InvalidSource(
+                        "empty shell AppsFolder target".into(),
+                    ));
+                }
+                Ok(vec![target, aumid])
+            }
+            _ => Ok(vec![base
+                .source_path()
+                .ok_or_else(|| IconCacheError::InvalidSource("no Windows target".into()))?
+                .to_string_lossy()
+                .into_owned()]),
+        }
     }
 
     fn is_ico(bytes: &[u8]) -> bool {
@@ -604,6 +640,32 @@ mod tests {
     }
 
     #[test]
+    fn windows_app_keys_are_case_insensitive_like_aumids() {
+        let lower = IconSource::WindowsApp {
+            app_user_model_id: "Example.App_123!App".into(),
+        };
+        let upper = IconSource::WindowsApp {
+            app_user_model_id: "example.app_123!app".into(),
+        };
+        assert_eq!(
+            CacheKey::for_source(&lower, 64).unwrap(),
+            CacheKey::for_source(&upper, 64).unwrap()
+        );
+    }
+
+    #[test]
+    fn shell_namespace_candidates_are_cacheable_with_fake_extractor() {
+        let root =
+            std::env::temp_dir().join(format!("taskbar-groups-shell-icon-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let policy = CachePolicy::new(&root, 64).unwrap();
+        let source = IconSource::Executable(PathBuf::from(r"shell:AppsFolder\Example.App_123!App"));
+        let entry = cache_icon(&policy, &Bytes, "group", &source).unwrap();
+        assert_eq!(fs::read(entry.path).unwrap(), b"icon");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn keys_prevent_same_filename_collisions() {
         let a = IconSource::WindowsApp {
             app_user_model_id: "a/b".into(),
@@ -650,6 +712,19 @@ mod tests {
                 }
             ),
             Err(IconCacheError::InvalidGroupName)
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_extraction_reports_unavailable_store_target_safely() {
+        let source = IconSource::Executable(PathBuf::from(
+            r"shell:AppsFolder\TaskbarGroups.TestPackage_000000000000!Missing",
+        ));
+        let result = PlatformIconExtractor.extract(&source, 32);
+        assert!(matches!(
+            result,
+            Err(IconCacheError::Extraction { .. }) | Err(IconCacheError::InvalidSource(_))
         ));
     }
 
