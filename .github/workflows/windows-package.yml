@@ -25,6 +25,66 @@ permissions:
   contents: read
 
 jobs:
+  # GitHub-hosted Windows labels identify Server images. They do not provide a
+  # guarantee of Windows 10 or Windows 11 client coverage; see WINDOWS-CI.md.
+  windows-compatibility:
+    name: Windows compatibility (${{ matrix.image }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-2022
+            image: Windows Server 2022
+          - runner: windows-2025
+            image: Windows Server 2025
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@1.97.1
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Report hosted desktop limitation
+        if: ${{ runner.environment == 'github-hosted' }}
+        shell: pwsh
+        run: |
+          Write-Host "${{ matrix.image }} is a GitHub-hosted Server image, not a Windows 10 or Windows 11 client runner."
+          Write-Host "Acceptance tests skip interactive desktop, Explorer, COM, and shell facilities when unavailable."
+
+      - name: Run locked cargo checks
+        shell: pwsh
+        run: cargo check --locked --all-targets
+
+      - name: Run locked tests
+        shell: pwsh
+        run: cargo test --locked --all-targets
+
+      - name: Run Windows acceptance tests
+        shell: pwsh
+        run: cargo test --locked --test windows_acceptance
+
+      - name: Build portable package
+        shell: pwsh
+        run: .\\packaging\\package.ps1
+
+      - name: Validate package and lifecycle
+        shell: pwsh
+        run: |
+          $archive = (Get-ChildItem .\\artifacts\\*.zip -File).FullName
+          .\\packaging\\validate.ps1 -Archive $archive -Manifest .\\artifacts\\manifest.json
+          .\\packaging\\test-lifecycle.ps1
+
+      - name: Upload compatibility artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: taskbar-groups-${{ matrix.runner }}-msvc
+          path: artifacts/**
+          if-no-files-found: error
+          retention-days: 14
+
   package:
     runs-on: windows-latest
     steps:
@@ -84,6 +144,7 @@ jobs:
           name: taskbar-groups-windows-msvc-manifest
           path: artifacts/manifest.json
           if-no-files-found: error
+          retention-days: 14
 
       - name: Upload versioned artifact
         uses: actions/upload-artifact@v4
@@ -91,3 +152,4 @@ jobs:
           name: taskbar-groups-windows-msvc
           path: artifacts/*.zip
           if-no-files-found: error
+          retention-days: 14
