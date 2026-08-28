@@ -32,6 +32,14 @@ pub enum NativeEvent {
     CtrlEnter,
 }
 
+pub fn keyboard_event(key: char, control: bool) -> Option<NativeEvent> {
+    match (key, control) {
+        ('\u{1b}', false) => Some(NativeEvent::Cancel),
+        ('\r', true) => Some(NativeEvent::CtrlEnter),
+        _ => None,
+    }
+}
+
 pub fn action_for_event(event: NativeEvent) -> Action {
     match event {
         NativeEvent::ReloadGroups => Action::ReloadGroups,
@@ -67,7 +75,7 @@ pub fn action_for_event(event: NativeEvent) -> Action {
 
 #[cfg(windows)]
 mod native {
-    use super::{action_for_event, NativeEvent};
+    use super::{action_for_event, keyboard_event, NativeEvent};
     use crate::{
         persistence::AppPaths,
         platform::{
@@ -83,11 +91,13 @@ mod native {
         ptr,
     };
     use windows_sys::Win32::{
-        Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM},
-        Graphics::Gdi::COLOR_WINDOW,
+        Foundation::{CloseHandle, GetLastError, HINSTANCE, HWND, LPARAM, LRESULT, WPARAM},
+        Graphics::Gdi::{
+            GetMonitorInfoW, MonitorFromWindow, COLOR_WINDOW, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+        },
         System::LibraryLoader::GetModuleHandleW,
         UI::{
-            Input::KeyboardAndMouse::{GetKeyState, VK_RETURN},
+            Input::KeyboardAndMouse::{GetKeyState, VK_ESCAPE, VK_RETURN},
             Shell::{DragAcceptFiles, DragFinish, DragQueryFileW, ShellExecuteW, HDROP},
             WindowsAndMessaging::*,
         },
@@ -128,6 +138,38 @@ mod native {
     const OFN_FILEMUSTEXIST: u32 = 0x0000_1000;
     const OFN_ALLOWMULTISELECT: u32 = 0x0000_0200;
     const BIF_RETURNONLYFSDIRS: u32 = 0x0001;
+
+    const COPYDATA_GROUP: usize = 1;
+    const SWP_NOACTIVATE: u32 = 0x0010;
+    const SWP_NOZORDER: u32 = 0x0004;
+    const ERROR_ALREADY_EXISTS: u32 = 183;
+    const DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2: isize = -4;
+
+    #[repr(C)]
+    struct CopyData {
+        data: usize,
+        length: u32,
+        pointer: *const core::ffi::c_void,
+    }
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn CreateMutexW(
+            attributes: *const core::ffi::c_void,
+            initial_owner: i32,
+            name: *const u16,
+        ) -> isize;
+    }
+
+    #[link(name = "ole32")]
+    unsafe extern "system" {
+        fn CoTaskMemFree(memory: *mut core::ffi::c_void);
+    }
+
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn SetProcessDpiAwarenessContext(value: isize) -> i32;
+    }
 
     #[repr(C)]
     struct OpenFileNameW {
@@ -225,6 +267,20 @@ mod native {
     }
 
     pub fn run(request: LaunchRequest, paths: AppPaths) -> io::Result<()> {
+        let mutex_name = wide("Local\\TaskbarGroupsNativeUi");
+        let mutex = unsafe { CreateMutexW(ptr::null(), 1, mutex_name.as_ptr()) };
+        if mutex == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
+            let result = forward_activation(request.group_name.as_deref());
+            unsafe { CloseHandle(mutex as _) };
+            return result;
+        }
+
+        // Per-monitor V2 keeps client coordinates and common controls scaled on
+        // mixed-DPI desktops. It must be selected before creating any windows.
+        unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
         let class = wide("TaskbarGroupsNativeUi");
         let instance = unsafe { GetModuleHandleW(ptr::null()) } as HINSTANCE;
         let wc = WNDCLASSW {
@@ -237,6 +293,7 @@ mod native {
             ..unsafe { std::mem::zeroed() }
         };
         if unsafe { RegisterClassW(&wc) } == 0 {
+            unsafe { CloseHandle(mutex as _) };
             return Err(io::Error::last_os_error());
         }
         let hwnd = unsafe {
@@ -256,8 +313,10 @@ mod native {
             )
         };
         if hwnd.is_null() {
+            unsafe { CloseHandle(mutex as _) };
             return Err(io::Error::last_os_error());
         }
+        place_on_work_area(hwnd);
         let controller = Controller::new(request, paths, NativeShell(hwnd));
         let mut ui = Box::new(build_ui(hwnd, controller));
         ui.controller
@@ -269,11 +328,66 @@ mod native {
         unsafe {
             let mut message = std::mem::zeroed();
             while GetMessageW(&mut message, ptr::null_mut(), 0, 0) > 0 {
+                if IsDialogMessageW(hwnd, &mut message) != 0 {
+                    continue;
+                }
                 TranslateMessage(&message);
                 DispatchMessageW(&message);
             }
         }
+        unsafe { CloseHandle(mutex as _) };
         Ok(())
+    }
+
+    fn forward_activation(group_name: Option<&str>) -> io::Result<()> {
+        let class = wide("TaskbarGroupsNativeUi");
+        let hwnd = unsafe { FindWindowW(class.as_ptr(), ptr::null()) };
+        if hwnd.is_null() {
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                "the existing Taskbar Groups window could not be found",
+            ));
+        }
+        let payload = wide(group_name.unwrap_or(""));
+        let copy = CopyData {
+            data: COPYDATA_GROUP,
+            length: (payload.len() * std::mem::size_of::<u16>()) as u32,
+            pointer: payload.as_ptr() as *const _,
+        };
+        unsafe {
+            SendMessageW(hwnd, WM_COPYDATA, 0, &copy as *const _ as LPARAM);
+            SetForegroundWindow(hwnd);
+        }
+        Ok(())
+    }
+
+    fn place_on_work_area(hwnd: HWND) {
+        let monitor = unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) };
+        if monitor.is_null() {
+            return;
+        }
+        let mut info = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..unsafe { std::mem::zeroed() }
+        };
+        if unsafe { GetMonitorInfoW(monitor, &mut info) } == 0 {
+            return;
+        }
+        let width = 860;
+        let height = 650;
+        let x = info.rcWork.left + (info.rcWork.right - info.rcWork.left - width).max(0) / 2;
+        let y = info.rcWork.top + (info.rcWork.bottom - info.rcWork.top - height).max(0) / 2;
+        unsafe {
+            SetWindowPos(
+                hwnd,
+                ptr::null_mut(),
+                x,
+                y,
+                0,
+                0,
+                SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+            );
+        }
     }
 
     fn build_ui(hwnd: HWND, controller: Controller<NativeShell>) -> NativeUi {
@@ -445,6 +559,28 @@ mod native {
                 DragAcceptFiles(hwnd, 1);
                 0
             }
+            WM_COPYDATA => {
+                if let Some(copy) = (_lparam as *const CopyData).as_ref() {
+                    if copy.data == COPYDATA_GROUP && copy.length >= 2 && !copy.pointer.is_null() {
+                        let units = copy.length as usize / std::mem::size_of::<u16>();
+                        let value = std::slice::from_raw_parts(copy.pointer as *const u16, units)
+                            .split(|unit| *unit == 0)
+                            .next()
+                            .map(String::from_utf16_lossy)
+                            .unwrap_or_default();
+                        if let Some(ui) =
+                            (GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut NativeUi).as_mut()
+                        {
+                            if value.is_empty() {
+                                SetForegroundWindow(hwnd);
+                            } else {
+                                dispatch(ui, NativeEvent::EditGroup(value));
+                            }
+                        }
+                    }
+                }
+                1
+            }
             WM_DROPFILES => {
                 if let Some(ui) = (GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut NativeUi).as_mut()
                 {
@@ -462,10 +598,15 @@ mod native {
             WM_KEYDOWN => {
                 if let Some(ui) = (GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut NativeUi).as_mut()
                 {
-                    if wparam == VK_RETURN as usize && GetKeyState(VK_CONTROL_KEY) < 0 {
-                        ui.controller
-                            .dispatch(action_for_event(NativeEvent::CtrlEnter));
-                        render(ui);
+                    let event = if wparam == VK_ESCAPE as usize {
+                        keyboard_event('\u{1b}', false)
+                    } else if wparam == VK_RETURN as usize && GetKeyState(VK_CONTROL_KEY) < 0 {
+                        keyboard_event('\r', true)
+                    } else {
+                        None
+                    };
+                    if let Some(event) = event {
+                        dispatch(ui, event);
                     }
                 }
                 0
@@ -555,14 +696,16 @@ mod native {
                 }
             }
         } else if id == BROWSE_FOLDER {
-            if let Some(path) = choose_folder(ui.hwnd) {
-                dispatch(
+            match choose_folder(ui.hwnd) {
+                Ok(Some(path)) => dispatch(
                     ui,
                     NativeEvent::AddShortcut {
                         path,
                         is_windows_app: false,
                     },
-                );
+                ),
+                Ok(None) => {}
+                Err(error) => ui.controller.shell_mut().show_error(&error.to_string()),
             }
         } else if id == BROWSE_ICON {
             if let Some(path) = choose_files(ui.hwnd, false).and_then(|mut paths| paths.pop()) {
@@ -593,10 +736,6 @@ mod native {
     fn dispatch(ui: &mut NativeUi, event: NativeEvent) {
         ui.controller.dispatch(action_for_event(event));
         render(ui);
-        if let Some(error) = ui.controller.view().error.as_ref() {
-            let message = error.to_string();
-            ui.controller.shell_mut().show_error(&message);
-        }
     }
 
     fn drop_files(ui: &mut NativeUi, drop: HDROP) {
@@ -687,7 +826,7 @@ mod native {
         }
     }
 
-    fn choose_folder(ui: HWND) -> Option<String> {
+    fn choose_folder(ui: HWND) -> io::Result<Option<String>> {
         let mut display = vec![0u16; 260];
         let title = wide("Select a folder shortcut target");
         let info = BrowseInfoW {
@@ -702,15 +841,22 @@ mod native {
         };
         let pidl = unsafe { SHBrowseForFolderW(&info) };
         if pidl.is_null() {
-            return None;
+            return Ok(None);
         }
         let mut path = vec![0u16; 32_768];
         let selected = unsafe { SHGetPathFromIDListW(pidl, path.as_mut_ptr()) } != 0;
-        selected.then(|| {
-            String::from_utf16_lossy(
+        let result = if selected {
+            Ok(Some(String::from_utf16_lossy(
                 &path[..path.iter().position(|c| *c == 0).unwrap_or(path.len())],
-            )
-        })
+            )))
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Windows returned a folder without a filesystem path",
+            ))
+        };
+        unsafe { CoTaskMemFree(pidl) };
+        result
     }
 
     fn nul_strings(buffer: &[u16]) -> Vec<String> {
@@ -914,7 +1060,15 @@ mod smoke_tests {
 mod tests {
     use super::*;
     #[test]
+    fn keyboard_events_are_portable_and_controller_friendly() {
+        assert_eq!(keyboard_event('\u{1b}', false), Some(NativeEvent::Cancel));
+        assert_eq!(keyboard_event('\r', true), Some(NativeEvent::CtrlEnter));
+        assert_eq!(keyboard_event('\r', false), None);
+    }
+
+    #[test]
     fn maps_editor_events_without_gui() {
+        assert_eq!(action_for_event(NativeEvent::Cancel), Action::CancelEditor);
         assert_eq!(
             action_for_event(NativeEvent::NewGroup),
             Action::BeginNewGroup
