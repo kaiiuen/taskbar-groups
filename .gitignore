@@ -1,0 +1,11 @@
+# Rust build output
+target/
+
+# Local runtime data
+config/
+Shortcuts/
+JITComp/
+
+# The legacy implementation is a nested, read-only research repository.
+# Keep it out of the rewrite repository's index.
+reference/

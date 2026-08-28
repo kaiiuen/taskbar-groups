@@ -1,0 +1,9 @@
+[package]
+name = "taskbar-groups"
+version = "0.1.0"
+edition = "2021"
+description = "A Rust reimplementation of Taskbar Groups for Windows"
+license = "MIT"
+repository = "https://github.com/kaiiuen/taskbar-groups"
+
+[dependencies]
