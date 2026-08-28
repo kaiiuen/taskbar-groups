@@ -5,14 +5,22 @@
 //! associated icon lookup for executable, shortcut, folder, and AppsFolder targets.
 
 use std::{
+    collections::HashMap,
     error::Error,
     fmt, fs,
     io::{self, Write},
     path::{Path, PathBuf},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Mutex, OnceLock,
+    },
     time::SystemTime,
 };
 
 const CACHE_VERSION: &str = "v2";
+const INDEX_FILE: &str = ".sources";
+static CACHE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Sizes used when a source already contains an ICO. The requested cache size is
 /// always included as the final frame so callers still get a useful size-specific
@@ -217,9 +225,36 @@ pub fn cache_icon<E: IconExtractor>(
     group: &str,
     source: &IconSource,
 ) -> Result<CacheEntry, IconCacheError> {
+    let _guard = CACHE_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    cache_icon_locked(policy, extractor, group, source)
+}
+
+fn cache_icon_locked<E: IconExtractor>(
+    policy: &CachePolicy,
+    extractor: &E,
+    group: &str,
+    source: &IconSource,
+) -> Result<CacheEntry, IconCacheError> {
     let output = policy.path_for(group, source)?;
+    let directory = output
+        .parent()
+        .ok_or_else(|| IconCacheError::InvalidSource("cache path has no parent".into()))?;
+    fs::create_dir_all(directory)?;
+    let key = source_stable_key(source);
+    let mut index = read_index(directory)?;
+    if let Some(previous) = index.get(&key) {
+        let previous = directory.join(previous);
+        if previous != output {
+            let _ = fs::remove_file(previous);
+        }
+    }
     if let Some(path) = source.source_path() {
         if !path.is_file() && !path.is_dir() {
+            index.remove(&key);
+            write_index(directory, &index)?;
             return Err(IconCacheError::MissingTarget(path.to_owned()));
         }
     }
@@ -230,16 +265,20 @@ pub fn cache_icon<E: IconExtractor>(
             message: "extractor returned no data".into(),
         });
     }
-    let directory = output
-        .parent()
-        .ok_or_else(|| IconCacheError::InvalidSource("cache path has no parent".into()))?;
-    fs::create_dir_all(directory)?;
-    let temporary = output.with_extension("tmp");
+    let temporary = output.with_extension(format!(
+        "tmp-{}",
+        TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
     let mut file = fs::File::create(&temporary)?;
     file.write_all(&bytes)?;
     file.sync_all()?;
     drop(file);
     fs::rename(&temporary, &output)?;
+    index.insert(
+        key,
+        output.file_name().unwrap().to_string_lossy().into_owned(),
+    );
+    write_index(directory, &index)?;
     Ok(CacheEntry {
         source: source.clone(),
         path: output,
@@ -256,11 +295,93 @@ pub fn rebuild_group_cache<E: IconExtractor>(
         Ok(path) => path,
         Err(error) => return vec![Err(error)],
     };
-    let _ = fs::remove_dir_all(&group_path);
-    sources
+    let _guard = CACHE_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let staging = policy.root.with_extension(format!(
+        "rebuild-{}",
+        TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    let staged_policy = CachePolicy::new(&staging, policy.size).expect("same valid size");
+    let results = sources
         .iter()
-        .map(|source| cache_icon(policy, extractor, group, source))
+        .map(|source| {
+            // cache_icon cannot be called here because the rebuild lock is held.
+            let result = cache_icon_locked(&staged_policy, extractor, group, source);
+            result
+        })
+        .collect::<Vec<_>>();
+    let staged_group = staging.join(group);
+    let _ = fs::remove_dir_all(&group_path);
+    let publish = if staged_group.exists() {
+        fs::create_dir_all(&policy.root).and_then(|_| fs::rename(staged_group, &group_path))
+    } else {
+        fs::create_dir_all(&group_path)
+    };
+    let _ = fs::remove_dir_all(&staging);
+    if let Err(error) = publish {
+        return vec![Err(error.into())];
+    }
+    results
+        .into_iter()
+        .map(|result| {
+            result.map(|entry| {
+                let source = entry.source;
+                let path = policy.path_for(group, &source).expect("validated");
+                CacheEntry { source, path }
+            })
+        })
         .collect()
+}
+
+fn source_stable_key(source: &IconSource) -> String {
+    match source {
+        IconSource::Indexed {
+            source,
+            resource_index,
+        } => format!("idx:{}:{resource_index}", source_stable_key(source)),
+        _ => format!(
+            "{}:{}",
+            source.identity().split('|').next().unwrap_or_default(),
+            source
+                .base_source()
+                .source_path()
+                .map(path_identity_without_metadata)
+                .unwrap_or_default()
+        ),
+    }
+}
+fn path_identity_without_metadata(path: &Path) -> String {
+    path.to_string_lossy()
+        .replace('/', "\\")
+        .to_ascii_lowercase()
+}
+fn read_index(directory: &Path) -> Result<HashMap<String, String>, IconCacheError> {
+    match fs::read_to_string(directory.join(INDEX_FILE)) {
+        Ok(text) => Ok(text
+            .lines()
+            .filter_map(|line| line.split_once('|'))
+            .map(|(a, b)| (a.into(), b.into()))
+            .collect()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(HashMap::new()),
+        Err(error) => Err(error.into()),
+    }
+}
+fn write_index(directory: &Path, index: &HashMap<String, String>) -> Result<(), IconCacheError> {
+    let mut entries = index.iter().collect::<Vec<_>>();
+    entries.sort_by_key(|(key, _)| *key);
+    let text = entries
+        .into_iter()
+        .map(|(a, b)| format!("{a}|{b}\\n"))
+        .collect::<String>();
+    let temp = directory.join(format!(
+        ".sources.tmp-{}",
+        TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    fs::write(&temp, text)?;
+    fs::rename(temp, directory.join(INDEX_FILE))?;
+    Ok(())
 }
 
 fn is_shell_namespace_target(path: &Path) -> bool {
