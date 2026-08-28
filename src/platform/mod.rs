@@ -272,6 +272,8 @@ impl fmt::Display for LaunchError {
 
 impl std::error::Error for LaunchError {}
 
+pub mod shell_link;
+
 #[cfg(windows)]
 mod windows;
 
