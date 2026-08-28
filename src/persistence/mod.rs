@@ -1,5 +1,7 @@
 //! Filesystem locations and persistence contracts for legacy taskbar groups.
 
+pub mod migration;
+
 use std::{
     env, fs,
     io::{self, ErrorKind},
@@ -52,6 +54,22 @@ impl AppPaths {
         fs::create_dir_all(&self.jit_comp)?;
         fs::create_dir_all(&self.config)?;
         fs::create_dir_all(&self.shortcuts)
+    }
+
+    /// Application-facing migration boundary. The caller chooses the legacy
+    /// source and portable/installed path policy; persistence owns all I/O.
+    pub fn migrate_legacy(
+        &self,
+        legacy_root: impl Into<PathBuf>,
+        policy: migration::PathRepairPolicy,
+    ) -> Result<migration::LegacyMigrationPlan, migration::MigrationError> {
+        let plan = migration::LegacyMigrationPlan::discover_with_policy(
+            legacy_root,
+            self.root.join("migrated-data"),
+            policy,
+        )?;
+        plan.execute()?;
+        Ok(plan)
     }
 
     pub fn group(&self, name: &str) -> io::Result<GroupPaths> {
