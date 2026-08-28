@@ -39,6 +39,10 @@ fn dry_run_preserves_legacy_group_identity_and_editable_link_properties() {
         "tjackenpacken.taskbarGroup.menu.Renamed"
     );
     assert!(!link.exists(), "edited dry-run must not create a link");
+
+    let explicit = AppUserModelId::explicit("com.example.TaskbarGroups.Acceptance")
+        .expect("construct explicit shell identity");
+    assert_eq!(explicit.value(), "com.example.TaskbarGroups.Acceptance");
 }
 
 #[test]
