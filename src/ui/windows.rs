@@ -40,6 +40,103 @@ pub fn keyboard_event(key: char, control: bool) -> Option<NativeEvent> {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UiRect {
+    pub x: i32,
+    pub y: i32,
+    pub width: i32,
+    pub height: i32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UiLayout {
+    pub groups: UiRect,
+    pub editor: UiRect,
+    pub shortcuts: UiRect,
+    pub apps: UiRect,
+    pub footer_y: i32,
+}
+
+/// Computes client-area coordinates in logical pixels. The minimums keep every
+/// editor control reachable when a window is restored to a small work area.
+pub fn layout_for_client(width: i32, height: i32) -> UiLayout {
+    let width = width.max(620);
+    let height = height.max(420);
+    let left_width = (width / 3).clamp(190, 300);
+    let right_x = 16 + left_width + 24;
+    let right_width = (width - right_x - 16).max(260);
+    let list_height = (height - 130).max(170);
+    let shortcut_width = (right_width - 140).max(180);
+    UiLayout {
+        groups: UiRect {
+            x: 16,
+            y: 42,
+            width: left_width,
+            height: list_height,
+        },
+        editor: UiRect {
+            x: right_x,
+            y: 24,
+            width: right_width,
+            height: 24,
+        },
+        shortcuts: UiRect {
+            x: right_x,
+            y: 195,
+            width: shortcut_width,
+            height: 140,
+        },
+        apps: UiRect {
+            x: right_x + shortcut_width + 12,
+            y: 195,
+            width: 128,
+            height: 140,
+        },
+        footer_y: (height - 42).max(360),
+    }
+}
+
+/// Keeps labels readable while retaining both ends of paths and identifiers.
+pub fn truncate_label(value: &str, max_chars: usize) -> String {
+    let count = value.chars().count();
+    if count <= max_chars || max_chars < 2 {
+        return value.chars().take(max_chars).collect();
+    }
+    let tail = max_chars / 2;
+    let head = max_chars - tail - 1;
+    format!(
+        "{}…{}",
+        value.chars().take(head).collect::<String>(),
+        value.chars().skip(count - tail).collect::<String>()
+    )
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn keyboard_focus_order() -> &'static [&'static str] {
+    &[
+        "groups",
+        "new",
+        "edit",
+        "group_name",
+        "icon",
+        "color",
+        "width",
+        "opacity",
+        "allow_all",
+        "shortcuts",
+        "shortcut_path",
+        "shortcut_name",
+        "arguments",
+        "workdir",
+        "add",
+        "discover_apps",
+        "save",
+        "delete",
+        "cancel",
+        "launch",
+    ]
+}
+
 pub fn action_for_event(event: NativeEvent) -> Action {
     match event {
         NativeEvent::ReloadGroups => Action::ReloadGroups,
@@ -75,7 +172,7 @@ pub fn action_for_event(event: NativeEvent) -> Action {
 
 #[cfg(windows)]
 mod native {
-    use super::{action_for_event, keyboard_event, NativeEvent};
+    use super::{action_for_event, keyboard_event, layout_for_client, NativeEvent, UiRect};
     use crate::{
         persistence::AppPaths,
         platform::{
@@ -91,13 +188,13 @@ mod native {
         ptr,
     };
     use windows_sys::Win32::{
-        Foundation::{CloseHandle, GetLastError, HINSTANCE, HWND, LPARAM, LRESULT, WPARAM},
+        Foundation::{CloseHandle, GetLastError, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM},
         Graphics::Gdi::{
             GetMonitorInfoW, MonitorFromWindow, COLOR_WINDOW, MONITORINFO, MONITOR_DEFAULTTONEAREST,
         },
         System::LibraryLoader::GetModuleHandleW,
         UI::{
-            Input::KeyboardAndMouse::{GetKeyState, VK_ESCAPE, VK_RETURN},
+            Input::KeyboardAndMouse::{GetKeyState, VK_ESCAPE, VK_MENU, VK_RETURN},
             Shell::{DragAcceptFiles, DragFinish, DragQueryFileW, ShellExecuteW, HDROP},
             WindowsAndMessaging::*,
         },
@@ -319,6 +416,7 @@ mod native {
         place_on_work_area(hwnd);
         let controller = Controller::new(request, paths, NativeShell(hwnd));
         let mut ui = Box::new(build_ui(hwnd, controller));
+        resize_ui(&mut ui);
         ui.controller
             .dispatch(action_for_event(NativeEvent::ReloadGroups));
         render(&mut ui);
@@ -373,19 +471,86 @@ mod native {
         if unsafe { GetMonitorInfoW(monitor, &mut info) } == 0 {
             return;
         }
-        let width = 860;
-        let height = 650;
-        let x = info.rcWork.left + (info.rcWork.right - info.rcWork.left - width).max(0) / 2;
-        let y = info.rcWork.top + (info.rcWork.bottom - info.rcWork.top - height).max(0) / 2;
+        let work_width = (info.rcWork.right - info.rcWork.left).max(1);
+        let work_height = (info.rcWork.bottom - info.rcWork.top).max(1);
+        let width = 860.min(work_width);
+        let height = 650.min(work_height);
+        let x = info.rcWork.left + (work_width - width) / 2;
+        let y = info.rcWork.top + (work_height - height) / 2;
         unsafe {
             SetWindowPos(
                 hwnd,
                 ptr::null_mut(),
                 x,
                 y,
-                0,
-                0,
-                SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+                width,
+                height,
+                SWP_NOZORDER | SWP_NOACTIVATE,
+            );
+        }
+    }
+
+    fn move_control(hwnd: HWND, rect: UiRect) {
+        unsafe {
+            SetWindowPos(
+                hwnd,
+                ptr::null_mut(),
+                rect.x,
+                rect.y,
+                rect.width,
+                rect.height,
+                SWP_NOZORDER | SWP_NOACTIVATE,
+            );
+        }
+    }
+
+    fn resize_ui(ui: &mut NativeUi) {
+        let mut client = RECT {
+            left: 0,
+            top: 0,
+            right: 0,
+            bottom: 0,
+        };
+        if unsafe { GetClientRect(ui.hwnd, &mut client) } == 0 {
+            return;
+        }
+        let layout = layout_for_client(client.right - client.left, client.bottom - client.top);
+        move_control(ui.groups, layout.groups);
+        move_control(ui.shortcuts, layout.shortcuts);
+        move_control(ui.apps, layout.apps);
+        let editor_x = layout.editor.x + 125;
+        let editor_width = (layout.editor.width - 125).max(135);
+        for (control, y) in [
+            (ui.group_name, 22),
+            (ui.icon, 66),
+            (ui.color, 110),
+            (ui.width, 110),
+            (ui.opacity, 110),
+        ] {
+            move_control(
+                control,
+                UiRect {
+                    x: editor_x,
+                    y,
+                    width: editor_width.min(260),
+                    height: 24,
+                },
+            );
+        }
+        for (control, y) in [
+            (ui.shortcut_path, 353),
+            (ui.shortcut_name, 353),
+            (ui.arguments, 397),
+            (ui.workdir, 397),
+        ] {
+            move_control(
+                control,
+                UiRect {
+                    x: layout.shortcuts.x + 125,
+                    y,
+                    width: (layout.shortcuts.width - 125).max(135),
+                    height: 24,
+                },
             );
         }
     }
@@ -394,7 +559,7 @@ mod native {
         let groups = control(
             "LISTBOX",
             "",
-            WS_CHILD | WS_VISIBLE | WS_BORDER | LBS_NOTIFY as u32 | WS_VSCROLL,
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_BORDER | LBS_NOTIFY as u32 | WS_VSCROLL,
             16,
             42,
             250,
@@ -421,7 +586,7 @@ mod native {
         let shortcuts = control(
             "LISTBOX",
             "",
-            WS_CHILD | WS_VISIBLE | WS_BORDER | LBS_NOTIFY as u32 | WS_VSCROLL,
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_BORDER | LBS_NOTIFY as u32 | WS_VSCROLL,
             290,
             195,
             535,
@@ -441,7 +606,7 @@ mod native {
         let apps = control(
             "LISTBOX",
             "",
-            WS_CHILD | WS_VISIBLE | WS_BORDER | LBS_NOTIFY as u32 | WS_VSCROLL,
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_BORDER | LBS_NOTIFY as u32 | WS_VSCROLL,
             700,
             195,
             125,
@@ -552,7 +717,7 @@ mod native {
         hwnd: HWND,
         message: u32,
         wparam: WPARAM,
-        _lparam: LPARAM,
+        lparam: LPARAM,
     ) -> LRESULT {
         match message {
             WM_CREATE => {
@@ -560,7 +725,7 @@ mod native {
                 0
             }
             WM_COPYDATA => {
-                if let Some(copy) = (_lparam as *const CopyData).as_ref() {
+                if let Some(copy) = (lparam as *const CopyData).as_ref() {
                     if copy.data == COPYDATA_GROUP && copy.length >= 2 && !copy.pointer.is_null() {
                         let units = copy.length as usize / std::mem::size_of::<u16>();
                         let value = std::slice::from_raw_parts(copy.pointer as *const u16, units)
@@ -588,6 +753,13 @@ mod native {
                 }
                 0
             }
+            WM_SIZE | WM_DPICHANGED => {
+                if let Some(ui) = (GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut NativeUi).as_mut()
+                {
+                    resize_ui(ui);
+                }
+                0
+            }
             WM_COMMAND => {
                 if let Some(ui) = (GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut NativeUi).as_mut()
                 {
@@ -598,10 +770,20 @@ mod native {
             WM_KEYDOWN => {
                 if let Some(ui) = (GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut NativeUi).as_mut()
                 {
+                    let alt = GetKeyState(VK_MENU as i32) < 0;
                     let event = if wparam == VK_ESCAPE as usize {
                         keyboard_event('\u{1b}', false)
                     } else if wparam == VK_RETURN as usize && GetKeyState(VK_CONTROL_KEY) < 0 {
                         keyboard_event('\r', true)
+                    } else if alt {
+                        match wparam as u32 {
+                            0x4E => Some(NativeEvent::NewGroup),
+                            0x45 => selected_group(ui).map(NativeEvent::EditGroup),
+                            0x53 => Some(NativeEvent::SaveGroup),
+                            0x43 => Some(NativeEvent::Cancel),
+                            0x4C => Some(NativeEvent::CtrlEnter),
+                            _ => None,
+                        }
                     } else {
                         None
                     };
@@ -619,7 +801,7 @@ mod native {
                 PostQuitMessage(0);
                 0
             }
-            _ => DefWindowProcW(hwnd, message, wparam, _lparam),
+            _ => DefWindowProcW(hwnd, message, wparam, lparam),
         }
     }
 
@@ -883,27 +1065,14 @@ mod native {
     }
 
     fn selected_group(ui: &NativeUi) -> Option<String> {
-        selected_text(ui.groups)
+        selected(ui.groups).and_then(|index| ui.controller.view().groups.get(index).cloned())
     }
 
     fn selected(hwnd: HWND) -> Option<usize> {
         let index = unsafe { SendMessageW(hwnd, LB_GETCURSEL, 0, 0) };
         (index >= 0).then_some(index as usize)
     }
-    fn selected_text(hwnd: HWND) -> Option<String> {
-        selected(hwnd).and_then(|index| list_text(hwnd, index))
-    }
-    fn list_text(hwnd: HWND, index: usize) -> Option<String> {
-        let length = unsafe { SendMessageW(hwnd, LB_GETTEXTLEN, index, 0) };
-        if length < 0 {
-            return None;
-        }
-        let mut text = vec![0u16; length as usize + 1];
-        unsafe {
-            SendMessageW(hwnd, LB_GETTEXT, index, text.as_mut_ptr() as LPARAM);
-        }
-        Some(String::from_utf16_lossy(&text[..length as usize]))
-    }
+
     fn nonempty(_ui: &NativeUi, hwnd: HWND) -> Option<String> {
         let value = text(hwnd);
         (!value.trim().is_empty()).then_some(value)
@@ -915,7 +1084,7 @@ mod native {
             SendMessageW(ui.groups, LB_RESETCONTENT, 0, 0);
         }
         for group in &ui.controller.view().groups {
-            let value = wide(group);
+            let value = wide(&super::truncate_label(group, 42));
             unsafe {
                 SendMessageW(ui.groups, LB_ADDSTRING, 0, value.as_ptr() as LPARAM);
             }
@@ -947,7 +1116,7 @@ mod native {
                 } else {
                     format!("{} — {}", shortcut.name, shortcut.file_path)
                 };
-                let value = wide(&label);
+                let value = wide(&super::truncate_label(&label, 76));
                 unsafe {
                     SendMessageW(ui.shortcuts, LB_ADDSTRING, 0, value.as_ptr() as LPARAM);
                 }
@@ -1064,6 +1233,32 @@ mod tests {
         assert_eq!(keyboard_event('\u{1b}', false), Some(NativeEvent::Cancel));
         assert_eq!(keyboard_event('\r', true), Some(NativeEvent::CtrlEnter));
         assert_eq!(keyboard_event('\r', false), None);
+    }
+
+    #[test]
+    fn layout_is_resize_aware_and_keeps_controls_in_bounds() {
+        let small = layout_for_client(320, 200);
+        assert!(small.groups.width > 0 && small.shortcuts.width > 0);
+        let large = layout_for_client(1400, 900);
+        assert!(large.groups.width > small.groups.width);
+        assert!(large.apps.x + large.apps.width <= 1400);
+    }
+
+    #[test]
+    fn long_labels_keep_both_ends() {
+        assert_eq!(truncate_label("short", 10), "short");
+        assert_eq!(truncate_label("abcdefghijklmnop", 9), "abcd…mnop");
+    }
+
+    #[test]
+    fn focus_order_is_explicit_and_actionable() {
+        let order = keyboard_focus_order();
+        assert_eq!(order.first(), Some(&"groups"));
+        assert_eq!(order.last(), Some(&"launch"));
+        assert!(
+            order.iter().position(|name| *name == "save")
+                < order.iter().position(|name| *name == "cancel")
+        );
     }
 
     #[test]
