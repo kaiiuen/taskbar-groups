@@ -1,9 +1,10 @@
 //! Windows Store/UWP/MSIX app discovery and AppUserModelID resolution.
 //!
 //! The data model and validation are portable. On Windows, discovery uses the
-//! supported Start menu and AppX PowerShell surfaces instead of reading the protected
-//! `WindowsApps` directory. AppX metadata is best-effort: a usable Start menu row is
-//! retained when package or manifest details are unavailable.
+//! supported WinRT package/AppListEntry APIs, with Start menu and AppX PowerShell
+//! surfaces as fallbacks. This avoids reading the protected `WindowsApps` directory.
+//! Metadata is best-effort: a usable app row is retained when package or manifest
+//! details are unavailable.
 
 use std::{error::Error, fmt};
 
@@ -186,10 +187,16 @@ pub struct WindowsShellAppDiscovery;
 #[cfg(windows)]
 impl WindowsAppDiscovery for WindowsShellAppDiscovery {
     fn enumerate(&self) -> Result<Vec<WindowsApp>, WindowsAppError> {
+        if let Ok(apps) = discover_winrt_apps() {
+            if !apps.is_empty() {
+                return Ok(apps);
+            }
+        }
+
         use std::process::Command;
 
-        // Get-StartApps is the authoritative launch catalog. The additional AppX
-        // queries enrich each row, but never make a valid shell row unusable.
+        // Get-StartApps remains the shell fallback. The additional AppX queries
+        // enrich each row, but never make a valid shell row unusable.
         let output = Command::new("powershell.exe")
             .args(["-NoProfile", "-NonInteractive", "-Command", METADATA_SCRIPT])
             .output()
@@ -236,6 +243,159 @@ impl WindowsAppDiscovery for WindowsShellAppDiscovery {
                 aumid: aumid.to_owned(),
             })
     }
+}
+
+#[cfg(windows)]
+fn discover_winrt_apps() -> Result<Vec<WindowsApp>, WindowsAppError> {
+    use windows::ApplicationModel::Core::AppListEntry;
+    use windows::Management::Deployment::PackageManager;
+
+    let manager = PackageManager::new().map_err(|error| WindowsAppError::Unavailable {
+        operation: "WinRT package discovery",
+        message: error.to_string(),
+    })?;
+    let packages = manager
+        .FindPackages()
+        .map_err(|error| WindowsAppError::Unavailable {
+            operation: "WinRT package enumeration",
+            message: error.to_string(),
+        })?;
+    let mut apps = Vec::new();
+
+    for package in packages
+        .First()
+        .map_err(|error| WindowsAppError::Unavailable {
+            operation: "WinRT package enumeration",
+            message: error.to_string(),
+        })?
+    {
+        if package.IsFramework().unwrap_or(true) {
+            continue;
+        }
+        let id = match package.Id() {
+            Ok(id) => id,
+            Err(_) => continue,
+        };
+        let package_path = package
+            .InstalledLocation()
+            .ok()
+            .and_then(|location| location.Path().ok().map(|path| path.to_string()));
+        let mut package_metadata = PackageMetadata::default();
+        package_metadata.package_name = id.Name().ok().map(|value| value.to_string());
+        package_metadata.package_family_name = id.FamilyName().ok().map(|value| value.to_string());
+        package_metadata.package_full_name = id.FullName().ok().map(|value| value.to_string());
+        package_metadata.publisher = id.Publisher().ok().map(|value| value.to_string());
+        package_metadata.version = id.Version().ok().map(|version| {
+            format!(
+                "{}.{}.{}.{}",
+                version.Major, version.Minor, version.Build, version.Revision
+            )
+        });
+        package_metadata.install_location = package_path.clone();
+
+        let entries = match package.GetAppListEntries() {
+            Ok(entries) => entries,
+            Err(_) => continue,
+        };
+        for index in 0..entries.Size().unwrap_or(0) {
+            let entry: AppListEntry = match entries.GetAt(index) {
+                Ok(entry) => entry,
+                Err(_) => continue,
+            };
+            let aumid = match entry.AppUserModelId() {
+                Ok(value) => value.to_string(),
+                Err(_) => continue,
+            };
+            let display_name = entry
+                .DisplayInfo()
+                .ok()
+                .and_then(|info| info.DisplayName().ok())
+                .map(|value| value.to_string())
+                .or_else(|| package.DisplayName().ok().map(|value| value.to_string()))
+                .unwrap_or_default();
+            let Ok(mut app) = WindowsApp::new(display_name, &aumid) else {
+                continue;
+            };
+            package_metadata.application_id = aumid.split('!').nth(1).map(str::to_owned);
+            let manifest = package_path
+                .as_deref()
+                .and_then(|path| {
+                    std::fs::read_to_string(std::path::Path::new(path).join("AppxManifest.xml"))
+                        .ok()
+                })
+                .and_then(|xml: String| {
+                    parse_manifest_application(
+                        xml.as_str(),
+                        package_metadata.application_id.as_deref(),
+                    )
+                });
+            if let Some(manifest) = manifest {
+                if let Some(executable) = manifest.executable {
+                    package_metadata.executable = package_path.as_deref().map(|path| {
+                        std::path::Path::new(path)
+                            .join(executable)
+                            .to_string_lossy()
+                            .into_owned()
+                    });
+                }
+                app = app.with_metadata(
+                    package_metadata.clone(),
+                    manifest.logo.map(|logo| {
+                        package_path
+                            .as_deref()
+                            .map(|path| {
+                                std::path::Path::new(path)
+                                    .join(&logo)
+                                    .to_string_lossy()
+                                    .into_owned()
+                            })
+                            .unwrap_or(logo)
+                    }),
+                );
+            } else {
+                app = app.with_package(package_metadata.clone());
+            }
+            apps.push(app);
+        }
+    }
+    Ok(apps)
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ManifestApplication {
+    executable: Option<String>,
+    logo: Option<String>,
+}
+
+fn parse_manifest_application(
+    xml: &str,
+    application_id: Option<&str>,
+) -> Option<ManifestApplication> {
+    let mut remainder = xml;
+    while let Some(start) = remainder.find("<Application ") {
+        let application = &remainder[start + 1..];
+        let (attributes, body) = application.split_once('>')?;
+        let id = xml_attribute(attributes, "Id");
+        let end = body.find("</Application>").unwrap_or(0);
+        let body = &body[..end];
+        if application_id.is_none() || id.as_deref() == application_id {
+            let visual_attributes = body
+                .find("VisualElements")
+                .and_then(|position| body[position..].split_once('>').map(|(tag, _)| tag));
+            return Some(ManifestApplication {
+                executable: xml_attribute(attributes, "Executable"),
+                logo: visual_attributes.and_then(|tag| xml_attribute(tag, "Logo")),
+            });
+        }
+        remainder = &application[attributes.len() + 1 + end..];
+    }
+    None
+}
+
+fn xml_attribute(attributes: &str, name: &str) -> Option<String> {
+    let marker = format!("{name}=\"");
+    let value = attributes.split_once(&marker)?.1.split_once('\"')?.0;
+    (!value.trim().is_empty()).then(|| value.to_owned())
 }
 
 fn parse_start_apps(input: &str) -> Result<Vec<WindowsApp>, WindowsAppError> {
@@ -478,6 +638,19 @@ mod tests {
             });
         }
         output
+    }
+
+    #[test]
+    fn parses_manifest_application_attributes_portably() {
+        let manifest = r#"<Applications><Application Id="Viewer" Executable="Viewer.exe"><uap:VisualElements Logo="Assets\Logo.png" /></Application></Applications>"#;
+        assert_eq!(
+            parse_manifest_application(manifest, Some("Viewer")),
+            Some(ManifestApplication {
+                executable: Some("Viewer.exe".to_owned()),
+                logo: Some("Assets\\Logo.png".to_owned()),
+            })
+        );
+        assert!(parse_manifest_application(manifest, Some("Other")).is_none());
     }
 
     #[test]
