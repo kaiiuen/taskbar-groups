@@ -272,6 +272,7 @@ impl fmt::Display for LaunchError {
 
 impl std::error::Error for LaunchError {}
 
+pub mod icon_cache;
 pub mod shell_link;
 
 #[cfg(windows)]
