@@ -231,6 +231,19 @@ pub trait Launcher {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LaunchError {
     Unsupported,
+    InvalidTarget {
+        target: String,
+        reason: String,
+    },
+    Process {
+        target: String,
+        message: String,
+    },
+    Shell {
+        target: String,
+        code: u32,
+        message: String,
+    },
     Failed(String),
 }
 
@@ -238,6 +251,20 @@ impl fmt::Display for LaunchError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Unsupported => write!(f, "launching is unsupported on this platform"),
+            Self::InvalidTarget { target, reason } => {
+                write!(f, "invalid launch target {target}: {reason}")
+            }
+            Self::Process { target, message } => {
+                write!(f, "could not start {target}: {message}")
+            }
+            Self::Shell {
+                target,
+                code,
+                message,
+            } => write!(
+                f,
+                "could not shell-launch {target} (code {code}): {message}"
+            ),
             Self::Failed(message) => f.write_str(message),
         }
     }
@@ -245,27 +272,11 @@ impl fmt::Display for LaunchError {
 
 impl std::error::Error for LaunchError {}
 
-/// Windows-only integration point. COM ShellLink dereferencing, `shell:appsFolder`
-/// activation, and `ProcessStartInfo` equivalent behavior belong behind this trait.
 #[cfg(windows)]
-#[derive(Debug, Default, Clone, Copy)]
-pub struct WindowsPlatform;
+mod windows;
 
 #[cfg(windows)]
-impl ShortcutResolver for WindowsPlatform {
-    fn resolve(&self, shortcut: &ProgramShortcut) -> Result<ResolvedTarget, ResolveError> {
-        // Keep COM/WinRT out of the dependency-free core until the Windows adapter
-        // is wired to the application's chosen ABI strategy.
-        PassthroughResolver.resolve(shortcut)
-    }
-}
-
-#[cfg(windows)]
-impl Launcher for WindowsPlatform {
-    fn launch(&self, _spec: &LaunchSpec) -> Result<(), LaunchError> {
-        Err(LaunchError::Unsupported)
-    }
-}
+pub use windows::WindowsPlatform;
 
 #[cfg(test)]
 mod tests {
