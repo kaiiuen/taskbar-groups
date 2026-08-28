@@ -19,6 +19,7 @@ pub enum NativeEvent {
     RemoveShortcut(usize),
     MoveShortcut { from: usize, to: usize },
     SelectShortcut(Option<usize>),
+    ElevateSelected,
     ShortcutName(String),
     Arguments(String),
     WorkingDirectory(String),
@@ -245,6 +246,7 @@ pub fn keyboard_focus_order() -> &'static [&'static str] {
         "save",
         "delete",
         "cancel",
+        "elevate_selected",
         "launch",
     ]
 }
@@ -268,6 +270,10 @@ pub fn action_for_event(event: NativeEvent) -> Action {
         NativeEvent::RemoveShortcut(index) => Action::RemoveShortcut(index),
         NativeEvent::MoveShortcut { from, to } => Action::MoveShortcut { from, to },
         NativeEvent::SelectShortcut(index) => Action::SelectShortcut(index),
+        // Elevation is deliberately handled by the native adapter rather than
+        // translated into a controller action: the controller's normal launch
+        // path must remain non-elevated.
+        NativeEvent::ElevateSelected => unreachable!("elevation is a native-only action"),
         NativeEvent::ShortcutName(value) => Action::SetShortcutName(value),
         NativeEvent::Arguments(value) => Action::SetArguments(value),
         NativeEvent::WorkingDirectory(value) => Action::SetWorkingDirectory(value),
@@ -283,6 +289,22 @@ pub fn action_for_event(event: NativeEvent) -> Action {
 }
 
 const ACTIVATION_VERSION: u16 = 1;
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn is_elevation_event(event: &NativeEvent) -> bool {
+    matches!(event, NativeEvent::ElevateSelected)
+}
+
+fn elevation_error(error: &crate::platform::LaunchError) -> String {
+    if matches!(
+        error,
+        crate::platform::LaunchError::Shell { code: 1223, .. }
+    ) {
+        "Elevation was cancelled; the selected shortcut was not launched.".to_owned()
+    } else {
+        format!("Could not launch the selected shortcut with elevation: {error}")
+    }
+}
 
 fn encode_activation(group_name: Option<&str>) -> Vec<u16> {
     let mut payload = vec![ACTIVATION_VERSION, group_name.is_some() as u16];
@@ -307,14 +329,15 @@ fn decode_activation(payload: &[u16]) -> Option<Option<String>> {
 #[cfg(windows)]
 mod native {
     use super::{
-        action_for_event, infer_taskbar_edge, keyboard_event, layout_for_client, place_flyout,
-        NativeEvent, TaskbarRect, UiRect, WorkArea,
+        action_for_event, elevation_error, infer_taskbar_edge, keyboard_event, layout_for_client,
+        place_flyout, NativeEvent, TaskbarRect, UiRect, WorkArea,
     };
     use crate::{
         persistence::AppPaths,
         platform::{
             windows_apps::{WindowsApp, WindowsAppDiscovery, WindowsShellAppDiscovery},
-            LaunchRequest, LaunchSpec, Launcher, WindowsPlatform,
+            LaunchRequest, LaunchSpec, Launcher, PassthroughResolver, ShortcutResolver,
+            WindowsPlatform,
         },
         ui::{Controller, UiShell},
     };
@@ -367,6 +390,7 @@ mod native {
     const WIDTH: i32 = 119;
     const OPACITY: i32 = 120;
     const LAUNCH: i32 = 121;
+    const ELEVATE: i32 = 128;
     const DISCOVER_APPS: i32 = 126;
     const APPS: i32 = 127;
     const VK_CONTROL_KEY: i32 = 0x11;
@@ -950,6 +974,7 @@ mod native {
         button(hwnd, "Delete", 390, 500, 90, 26, DELETE);
         button(hwnd, "Cancel", 490, 500, 90, 26, CANCEL);
         button(hwnd, "Launch all", 590, 500, 100, 26, LAUNCH);
+        button(hwnd, "Run elevated", 700, 500, 110, 26, ELEVATE);
         NativeUi {
             controller,
             hwnd,
@@ -1143,6 +1168,7 @@ mod native {
                 selected_group(ui).map(NativeEvent::EditGroup)
             }
             LAUNCH => Some(NativeEvent::CtrlEnter),
+            ELEVATE if notification == BN_CLICKED => Some(NativeEvent::ElevateSelected),
             GROUP_NAME if notification == EN_CHANGE => {
                 Some(NativeEvent::GroupName(text(ui.group_name)))
             }
@@ -1244,8 +1270,60 @@ mod native {
     }
 
     fn dispatch(ui: &mut NativeUi, event: NativeEvent) {
-        ui.controller.dispatch(action_for_event(event));
-        render(ui);
+        if matches!(event, NativeEvent::ElevateSelected) {
+            elevate_selected(ui);
+        } else {
+            ui.controller.dispatch(action_for_event(event));
+            render(ui);
+        }
+    }
+
+    pub(crate) fn selected_elevation_policy() -> crate::platform::special_targets::ElevationPolicy {
+        crate::platform::special_targets::ElevationPolicy::RunAs
+    }
+
+    fn elevate_selected(ui: &mut NativeUi) {
+        let Some(index) = ui.controller.view().selected_shortcut else {
+            ui.controller
+                .shell_mut()
+                .show_error("Select a shortcut first.");
+            return;
+        };
+        let Some(shortcut) = ui
+            .controller
+            .view()
+            .editor
+            .as_ref()
+            .and_then(|group| group.shortcut_list.get(index))
+        else {
+            ui.controller
+                .shell_mut()
+                .show_error("The selected shortcut is no longer available.");
+            return;
+        };
+        let spec = match PassthroughResolver.resolve(shortcut) {
+            Ok(target) => LaunchSpec {
+                target,
+                arguments: shortcut.arguments.clone(),
+                working_directory: shortcut.working_directory.clone(),
+            },
+            Err(error) => {
+                ui.controller
+                    .shell_mut()
+                    .show_error(&format!("Could not elevate the selected shortcut: {error}"));
+                return;
+            }
+        };
+        match WindowsPlatform.launch_with_policy(&spec, selected_elevation_policy()) {
+            Ok(()) => ui
+                .controller
+                .shell_mut()
+                .show_message("Elevation prompt launched for the selected shortcut."),
+            Err(error) => ui
+                .controller
+                .shell_mut()
+                .show_error(&elevation_error(&error)),
+        }
     }
 
     fn drop_files(ui: &mut NativeUi, drop: HDROP) {
@@ -1597,6 +1675,14 @@ mod smoke_tests {
             Action::SelectWindowsApp(_)
         ));
     }
+
+    #[test]
+    fn elevation_policy_selection_is_safe_without_launching() {
+        assert_eq!(
+            super::native::selected_elevation_policy(),
+            crate::platform::special_targets::ElevationPolicy::RunAs
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1628,6 +1714,25 @@ mod tests {
         assert_eq!(keyboard_event('\u{1b}', false), Some(NativeEvent::Cancel));
         assert_eq!(keyboard_event('\r', true), Some(NativeEvent::CtrlEnter));
         assert_eq!(keyboard_event('\r', false), None);
+    }
+
+    #[test]
+    fn elevation_is_an_explicit_native_event() {
+        assert!(is_elevation_event(&NativeEvent::ElevateSelected));
+        assert!(!is_elevation_event(&NativeEvent::CtrlEnter));
+    }
+
+    #[test]
+    fn elevation_cancellation_has_clear_user_facing_text() {
+        let error = crate::platform::LaunchError::Shell {
+            target: "example.exe".into(),
+            code: 1223,
+            message: "The operation was canceled by the user".into(),
+        };
+        assert_eq!(
+            elevation_error(&error),
+            "Elevation was cancelled; the selected shortcut was not launched."
+        );
     }
 
     #[test]
