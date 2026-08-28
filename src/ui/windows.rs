@@ -57,6 +57,75 @@ pub struct UiLayout {
     pub footer_y: i32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WorkArea {
+    pub x: i32,
+    pub y: i32,
+    pub width: i32,
+    pub height: i32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TaskbarRect {
+    pub rect: UiRect,
+    pub edge: TaskbarEdge,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskbarEdge {
+    Top,
+    Bottom,
+    Left,
+    Right,
+}
+
+/// Computes a flyout position without assuming a taskbar or screen ordering.
+///
+/// The optional taskbar is only used when the anchor is inside its rectangle;
+/// auto-hidden and unavailable taskbars therefore take the same safe fallback.
+pub fn place_flyout(
+    work_area: WorkArea,
+    taskbar: Option<TaskbarRect>,
+    anchor: (i32, i32),
+    requested_size: (i32, i32),
+) -> UiRect {
+    let width = requested_size.0.max(1).min(work_area.width.max(1));
+    let height = requested_size.1.max(1).min(work_area.height.max(1));
+    let area = WorkArea {
+        width: work_area.width.max(width),
+        height: work_area.height.max(height),
+        ..work_area
+    };
+    let anchor_in_taskbar = taskbar.is_some_and(|bar| {
+        let right = bar.rect.x.saturating_add(bar.rect.width.max(0));
+        let bottom = bar.rect.y.saturating_add(bar.rect.height.max(0));
+        anchor.0 >= bar.rect.x && anchor.0 < right && anchor.1 >= bar.rect.y && anchor.1 < bottom
+    });
+    let gap = 10;
+    let (x, y) = match taskbar.filter(|_| anchor_in_taskbar) {
+        Some(bar) => match bar.edge {
+            TaskbarEdge::Top => (anchor.0 - width / 2, bar.rect.y + bar.rect.height + gap),
+            TaskbarEdge::Bottom => (anchor.0 - width / 2, bar.rect.y - height - gap),
+            TaskbarEdge::Left => (bar.rect.x + bar.rect.width + gap, anchor.1 - height / 2),
+            TaskbarEdge::Right => (bar.rect.x - width - gap, anchor.1 - height / 2),
+        },
+        None => (anchor.0 - width / 2, anchor.1 - height - 20),
+    };
+    UiRect {
+        x: clamp_position(x, area.x, area.width, width),
+        y: clamp_position(y, area.y, area.height, height),
+        width,
+        height,
+    }
+}
+
+fn clamp_position(position: i32, origin: i32, extent: i32, size: i32) -> i32 {
+    position
+        .max(origin)
+        .min(origin.saturating_add(extent).saturating_sub(size))
+}
+
 /// Computes client-area coordinates in logical pixels. The minimums keep every
 /// editor control reachable when a window is restored to a small work area.
 pub fn layout_for_client(width: i32, height: i32) -> UiLayout {
@@ -172,7 +241,10 @@ pub fn action_for_event(event: NativeEvent) -> Action {
 
 #[cfg(windows)]
 mod native {
-    use super::{action_for_event, keyboard_event, layout_for_client, NativeEvent, UiRect};
+    use super::{
+        action_for_event, keyboard_event, layout_for_client, place_flyout, NativeEvent, UiRect,
+        WorkArea,
+    };
     use crate::{
         persistence::AppPaths,
         platform::{
@@ -475,16 +547,28 @@ mod native {
         let work_height = (info.rcWork.bottom - info.rcWork.top).max(1);
         let width = 860.min(work_width);
         let height = 650.min(work_height);
-        let x = info.rcWork.left + (work_width - width) / 2;
-        let y = info.rcWork.top + (work_height - height) / 2;
+        let placement = place_flyout(
+            WorkArea {
+                x: info.rcWork.left,
+                y: info.rcWork.top,
+                width: work_width,
+                height: work_height,
+            },
+            None,
+            (
+                info.rcWork.left + work_width / 2,
+                info.rcWork.top + work_height / 2 + height / 2 + 20,
+            ),
+            (width, height),
+        );
         unsafe {
             SetWindowPos(
                 hwnd,
                 ptr::null_mut(),
-                x,
-                y,
-                width,
-                height,
+                placement.x,
+                placement.y,
+                placement.width,
+                placement.height,
                 SWP_NOZORDER | SWP_NOACTIVATE,
             );
         }
@@ -1242,6 +1326,125 @@ mod tests {
         let large = layout_for_client(1400, 900);
         assert!(large.groups.width > small.groups.width);
         assert!(large.apps.x + large.apps.width <= 1400);
+    }
+
+    #[test]
+    fn placement_clamps_to_negative_coordinate_work_area() {
+        let placement = place_flyout(
+            WorkArea {
+                x: -1920,
+                y: -200,
+                width: 1920,
+                height: 1080,
+            },
+            None,
+            (-10, 20),
+            (860, 650),
+        );
+        assert_eq!(placement.x, -860);
+        assert_eq!(placement.y, -200);
+        assert_eq!(placement.width, 860);
+        assert_eq!(placement.height, 650);
+    }
+
+    #[test]
+    fn placement_handles_each_taskbar_edge_without_indexing_screens() {
+        let area = WorkArea {
+            x: 0,
+            y: 0,
+            width: 2560,
+            height: 1440,
+        };
+        let cases = [
+            (
+                TaskbarEdge::Top,
+                UiRect {
+                    x: 0,
+                    y: 0,
+                    width: 2560,
+                    height: 40,
+                },
+                (1280, 20),
+                (850, 650),
+                (855, 50),
+            ),
+            (
+                TaskbarEdge::Bottom,
+                UiRect {
+                    x: 0,
+                    y: 1400,
+                    width: 2560,
+                    height: 40,
+                },
+                (1280, 1420),
+                (850, 650),
+                (855, 740),
+            ),
+            (
+                TaskbarEdge::Left,
+                UiRect {
+                    x: 0,
+                    y: 0,
+                    width: 40,
+                    height: 1440,
+                },
+                (20, 720),
+                (850, 650),
+                (50, 395),
+            ),
+            (
+                TaskbarEdge::Right,
+                UiRect {
+                    x: 2520,
+                    y: 0,
+                    width: 40,
+                    height: 1440,
+                },
+                (2540, 720),
+                (850, 650),
+                (1660, 395),
+            ),
+        ];
+        for (edge, rect, anchor, size, expected) in cases {
+            let placement = place_flyout(area, Some(TaskbarRect { rect, edge }), anchor, size);
+            assert_eq!((placement.x, placement.y), expected);
+        }
+    }
+
+    #[test]
+    fn placement_falls_back_for_auto_hide_and_clamps_portrait_edges() {
+        let portrait = WorkArea {
+            x: 100,
+            y: -900,
+            width: 600,
+            height: 1200,
+        };
+        let placement = place_flyout(portrait, None, (690, -890), (900, 1400));
+        assert_eq!(
+            placement,
+            UiRect {
+                x: 100,
+                y: -900,
+                width: 600,
+                height: 1200
+            }
+        );
+
+        let bottom = place_flyout(
+            portrait,
+            Some(TaskbarRect {
+                rect: UiRect {
+                    x: 100,
+                    y: -900,
+                    width: 600,
+                    height: 40,
+                },
+                edge: TaskbarEdge::Top,
+            }),
+            (690, -890),
+            (400, 300),
+        );
+        assert_eq!((bottom.x, bottom.y), (300, -850));
     }
 
     #[test]
