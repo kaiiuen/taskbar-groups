@@ -17,17 +17,12 @@ mod windows_acceptance {
         domain::{Category, ProgramShortcut},
         persistence::{migration::PathRepairPolicy, AppPaths},
         platform::{
-            icon_cache::{
-                cache_icon, CachePolicy, IconExtractor, IconSource, PlatformIconExtractor,
-            },
+            icon_cache::{cache_icon, CachePolicy, IconSource, PlatformIconExtractor},
             shell_link::{create_or_update, AppUserModelId, ShellLinkError, ShellLinkRequest},
             LaunchSpec, Launcher, ResolvedTarget, TargetKind, WindowsPlatform,
         },
     };
-    use windows_sys::Win32::{
-        Foundation::HWND,
-        UI::{Shell::ShellExecuteW, WindowsAndMessaging::GetDesktopWindow},
-    };
+    use windows_sys::Win32::UI::{Shell::ShellExecuteW, WindowsAndMessaging::GetDesktopWindow};
 
     struct TempRoot(PathBuf);
 
@@ -292,7 +287,7 @@ mod windows_acceptance {
                 0,
             )
         };
-        if result <= 32 {
+        if result as usize <= 32 {
             eprintln!("SKIP: native shell facility cannot open a known system file");
         }
     }
@@ -344,9 +339,9 @@ mod windows_acceptance {
         assert_eq!(
             values,
             vec![
-                target.to_string_lossy(),
+                target.to_string_lossy().into_owned(),
                 arguments.to_owned(),
-                directory.to_string_lossy(),
+                directory.to_string_lossy().into_owned(),
                 description.to_owned()
             ]
         );
