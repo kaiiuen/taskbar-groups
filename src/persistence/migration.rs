@@ -17,6 +17,23 @@ pub const DESTINATION_VERSION: &str = "v1";
 pub const DESTINATION_GROUPS_DIRECTORY: &str = "groups";
 pub const DESTINATION_FILE: &str = "ObjectData.xml";
 
+/// Selects where the versioned persistence tree is stored.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DataRootPolicy {
+    /// Store data below the supplied application directory.
+    Portable(PathBuf),
+    /// Store data below the current user's writable application-data directory.
+    Installed { application_name: String },
+}
+
+/// A completed migration and the backup that can be used for recovery.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MigrationReport {
+    pub backup_path: PathBuf,
+    pub destination_root: PathBuf,
+    pub recovered: bool,
+}
+
 /// Controls how legacy relative values are represented in the imported data.
 /// Portable imports retain relative values so the application directory can be
 /// moved as a unit. Installed imports repair both relative and executable-
@@ -50,6 +67,9 @@ pub enum MigrationError {
     InvalidSource { path: PathBuf, reason: String },
     InvalidCategory { path: PathBuf, reason: String },
     Collision { path: PathBuf },
+    Backup { path: PathBuf, source: io::Error },
+    Recovery { path: PathBuf, source: io::Error },
+    InvalidDataRoot { reason: String },
 }
 
 impl std::fmt::Display for MigrationError {
@@ -71,13 +91,70 @@ impl std::fmt::Display for MigrationError {
                 "migration destination already exists: {}",
                 path.display()
             ),
+            Self::Backup { path, source } => {
+                write!(
+                    formatter,
+                    "cannot create migration backup {}: {source}",
+                    path.display()
+                )
+            }
+            Self::Recovery { path, source } => {
+                write!(
+                    formatter,
+                    "migration recovery failed at {}: {source}",
+                    path.display()
+                )
+            }
+            Self::InvalidDataRoot { reason } => {
+                write!(formatter, "invalid persistence data root: {reason}")
+            }
         }
     }
 }
 
 impl std::error::Error for MigrationError {}
 
+/// Resolve a persistence root without ever selecting the installation directory
+/// for installed mode. Portable mode is intentionally explicit and unchanged.
+pub fn resolve_data_root(policy: DataRootPolicy) -> Result<PathBuf, MigrationError> {
+    match policy {
+        DataRootPolicy::Portable(root) if root.as_os_str().is_empty() => {
+            Err(MigrationError::InvalidDataRoot {
+                reason: "portable root is empty".into(),
+            })
+        }
+        DataRootPolicy::Portable(root) => Ok(root),
+        DataRootPolicy::Installed { application_name } => {
+            let name = stored_group_name(&application_name).map_err(|reason| {
+                MigrationError::InvalidDataRoot {
+                    reason: format!("invalid application name: {reason}"),
+                }
+            })?;
+            let base = std::env::var_os("LOCALAPPDATA")
+                .or_else(|| std::env::var_os("APPDATA"))
+                .or_else(|| {
+                    std::env::var_os("HOME")
+                        .map(|home| PathBuf::from(home).join(".local/share").into_os_string())
+                })
+                .ok_or_else(|| MigrationError::InvalidDataRoot {
+                    reason: "no user application-data directory is available".into(),
+                })?;
+            Ok(PathBuf::from(base).join(name))
+        }
+    }
+}
+
 impl LegacyMigrationPlan {
+    /// Discover using an explicit portable or installed data-root policy.
+    pub fn discover_for_root_policy(
+        legacy_root: impl Into<PathBuf>,
+        root_policy: DataRootPolicy,
+        path_policy: PathRepairPolicy,
+    ) -> Result<Self, MigrationError> {
+        let destination = resolve_data_root(root_policy)?;
+        Self::discover_with_policy(legacy_root, destination, path_policy)
+    }
+
     /// Discover a migration using installed-style path repair.
     pub fn discover(
         legacy_root: impl Into<PathBuf>,
@@ -199,6 +276,10 @@ impl LegacyMigrationPlan {
     /// one rename. A source/read/write failure therefore leaves no destination
     /// files or directories behind.
     pub fn execute(&self) -> Result<(), MigrationError> {
+        self.execute_with_backup().map(|_| ())
+    }
+
+    fn execute_without_backup(&self) -> Result<(), MigrationError> {
         let version_directory = self.destination_root.join(DESTINATION_VERSION);
         if version_directory.exists() {
             return Err(MigrationError::Collision {
@@ -220,6 +301,59 @@ impl LegacyMigrationPlan {
             let _ = fs::remove_dir_all(&staging);
         }
         result
+    }
+
+    /// Execute after taking a copy of the legacy source. The source is never
+    /// removed; the returned path is suitable for diagnostics or restoration.
+    pub fn execute_with_backup(&self) -> Result<MigrationReport, MigrationError> {
+        let backup_path = self.backup_path();
+        copy_tree(&self.legacy_root.join("config"), &backup_path).map_err(|source| {
+            MigrationError::Backup {
+                path: backup_path.clone(),
+                source,
+            }
+        })?;
+        if let Err(error) = self.execute_without_backup() {
+            return Err(error);
+        }
+        Ok(MigrationReport {
+            backup_path,
+            destination_root: self.destination_root.clone(),
+            recovered: false,
+        })
+    }
+
+    /// Restore the backed-up legacy config tree, replacing only that tree.
+    pub fn restore_backup(&self, backup_path: &Path) -> Result<(), MigrationError> {
+        let config = self.legacy_root.join("config");
+        let temporary = self.legacy_root.join(".migration-restore");
+        copy_tree(backup_path, &temporary).map_err(|source| MigrationError::Recovery {
+            path: temporary.clone(),
+            source,
+        })?;
+        let result = (|| {
+            if config.exists() {
+                fs::remove_dir_all(&config)?;
+            }
+            fs::rename(&temporary, &config)
+        })();
+        if let Err(source) = result {
+            let _ = fs::remove_dir_all(&temporary);
+            return Err(MigrationError::Recovery {
+                path: config,
+                source,
+            });
+        }
+        Ok(())
+    }
+
+    fn backup_path(&self) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or_default();
+        self.destination_root
+            .with_file_name(format!(".migration-backup-{nonce}"))
     }
 
     fn staging_directory(&self) -> PathBuf {
@@ -255,6 +389,28 @@ impl LegacyMigrationPlan {
         }
         Ok(())
     }
+}
+
+fn copy_tree(source: &Path, destination: &Path) -> io::Result<()> {
+    let metadata = fs::symlink_metadata(source)?;
+    if metadata.is_dir() {
+        fs::create_dir_all(destination)?;
+        for entry in fs::read_dir(source)? {
+            let entry = entry?;
+            copy_tree(&entry.path(), &destination.join(entry.file_name()))?;
+        }
+    } else if metadata.is_file() {
+        if let Some(parent) = destination.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::copy(source, destination)?;
+    } else {
+        return Err(io::Error::new(
+            ErrorKind::InvalidData,
+            "backup source is not a regular file or directory",
+        ));
+    }
+    Ok(())
 }
 
 fn read_category(path: &Path) -> Result<Category, MigrationError> {
@@ -463,5 +619,45 @@ mod tests {
             plan.execute(),
             Err(MigrationError::Collision { .. })
         ));
+    }
+
+    #[test]
+    fn backup_can_restore_the_legacy_config_after_a_failed_migration() {
+        let root = TempDir::new();
+        write_group(&root.0, "Games", XML);
+        let destination = root.0.join("out");
+        let plan = LegacyMigrationPlan::discover_with_policy(
+            &root.0,
+            &destination,
+            PathRepairPolicy::Portable,
+        )
+        .unwrap();
+        let report = plan.execute_with_backup().unwrap();
+        assert!(report.backup_path.join("Games/ObjectData.xml").is_file());
+        fs::write(root.0.join("config/Games/ObjectData.xml"), "changed").unwrap();
+        plan.restore_backup(&report.backup_path).unwrap();
+        assert_eq!(
+            fs::read_to_string(root.0.join("config/Games/ObjectData.xml")).unwrap(),
+            XML
+        );
+    }
+
+    #[test]
+    fn installed_root_is_user_data_and_portable_root_is_explicit() {
+        let portable = root_policy_path(DataRootPolicy::Portable(PathBuf::from("portable")));
+        assert_eq!(portable, PathBuf::from("portable"));
+        let installed = resolve_data_root(DataRootPolicy::Installed {
+            application_name: "Taskbar Groups".into(),
+        })
+        .unwrap();
+        assert_eq!(installed.file_name().unwrap(), "Taskbar_Groups");
+        assert_ne!(
+            installed,
+            std::env::current_exe().unwrap().parent().unwrap()
+        );
+    }
+
+    fn root_policy_path(policy: DataRootPolicy) -> PathBuf {
+        resolve_data_root(policy).unwrap()
     }
 }
