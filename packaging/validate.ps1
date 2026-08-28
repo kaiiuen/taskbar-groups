@@ -26,18 +26,31 @@ try {
         if ($entries -notcontains $entry) { throw "Archive is missing required entry: $entry" }
     }
 
-    $forbidden = @("reference/", "src/", "Cargo.toml", "Cargo.lock", ".pdb")
     foreach ($entry in $entries) {
-        foreach ($prefix in $forbidden) {
-            if ($entry -eq $prefix.TrimEnd("/") -or $entry.StartsWith($prefix)) {
-                throw "Archive contains forbidden entry: $entry"
-            }
+        $normalizedEntry = $entry.ToLowerInvariant()
+        if ($normalizedEntry -match '(^|/)(reference|src)(/|$)' -or
+            $normalizedEntry -match '(^|/)(cargo\.toml|cargo\.lock)$' -or
+            $normalizedEntry -match '\.pdb$') {
+            throw "Archive contains forbidden entry: $entry"
         }
     }
 
+    $repositoryRoot = (Resolve-Path (Join-Path $PSScriptRoot ".." )).Path
+    $cargoManifestPath = Join-Path $repositoryRoot "Cargo.toml"
+    $releaseMetadataPath = Join-Path $PSScriptRoot "release-metadata.json"
+    $releaseMetadata = Get-Content -LiteralPath $releaseMetadataPath -Raw | ConvertFrom-Json
+    $cargoMetadata = & cargo metadata --manifest-path $cargoManifestPath --no-deps --format-version 1 | ConvertFrom-Json
+    $package = @($cargoMetadata.packages | Where-Object { $_.name -eq "taskbar-groups" })[0]
+    if ($null -eq $package) { throw "Could not find taskbar-groups in Cargo metadata." }
+
+    $version = [string]$package.version
     $archiveName = [System.IO.Path]::GetFileNameWithoutExtension($archivePath)
-    if ($archiveName -notmatch '^taskbar-groups-v[^-]+-x86_64-pc-windows-msvc$') {
-        throw "Archive name is not versioned for the supported MSVC target: $archiveName"
+    $expectedArchive = "taskbar-groups-v{0}-x86_64-pc-windows-msvc" -f $version
+    if ($archiveName -cne $expectedArchive) {
+        throw "Archive name $archiveName does not match expected package $expectedArchive."
+    }
+    if ([string]$releaseMetadata.version -cne $version) {
+        throw "Cargo version $version does not match release metadata version $($releaseMetadata.version)."
     }
 
     $unexpected = @($entries | Where-Object {
@@ -51,17 +64,26 @@ try {
     $metadataReader = [System.IO.StreamReader]::new($metadataEntry.Open())
     try { $metadata = $metadataReader.ReadToEnd() | ConvertFrom-Json }
     finally { $metadataReader.Dispose() }
-    if ($metadata.target -ne "x86_64-pc-windows-msvc") { throw "Release metadata target is not the supported MSVC target." }
-    if ($metadata.artifact -ne ([System.IO.Path]::GetFileName($archivePath))) { throw "Release metadata artifact name does not match the archive." }
+    if ([string]$metadata.product -cne [string]$releaseMetadata.product) { throw "Release metadata product is incorrect." }
+    if ([string]$metadata.version -cne $version) { throw "Release metadata version is incorrect." }
+    if ([string]$metadata.target -cne "x86_64-pc-windows-msvc") { throw "Release metadata target is not the supported MSVC target." }
+    if ([string]$metadata.artifact -cne ([System.IO.Path]::GetFileName($archivePath))) { throw "Release metadata artifact name does not match the archive." }
+    if ([string]$metadata.source.commit -notmatch '^[0-9a-f]{40}$') { throw "Release metadata source commit is not a full Git SHA-1." }
+    if ([string]$metadata.source.repository -cne [string]$releaseMetadata.source.repository) { throw "Release metadata repository is incorrect." }
+    if ([string]$metadata.source.ref -cne [string]$releaseMetadata.source.ref) { throw "Release metadata ref is incorrect." }
 
     if ($Manifest) {
         $manifestPath = (Resolve-Path $Manifest).Path
         $manifestDocument = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
         $actualHash = (Get-FileHash -LiteralPath $archivePath -Algorithm SHA256).Hash.ToLowerInvariant()
-        $fileMatches = [string]$manifestDocument.file -ceq [System.IO.Path]::GetFileName($archivePath)
+        $manifestFileName = [System.IO.Path]::GetFileName($archivePath)
+        $fileMatches = [string]$manifestDocument.file -ceq $manifestFileName
         $hashMatches = [string]$manifestDocument.sha256 -ceq [string]$actualHash
-        if (-not ($fileMatches -and $hashMatches)) {
-            throw "Release manifest does not match the archive SHA-256 or filename."
+        $manifestVersionMatches = [string]$manifestDocument.version -ceq $version
+        $manifestTargetMatches = [string]$manifestDocument.target -ceq "x86_64-pc-windows-msvc"
+        $manifestCommitMatches = [string]$manifestDocument.sourceCommit -ceq [string]$metadata.source.commit
+        if (-not ($fileMatches -and $hashMatches -and $manifestVersionMatches -and $manifestTargetMatches -and $manifestCommitMatches)) {
+            throw "Release manifest does not match archive filename, version, target, source commit, or SHA-256."
         }
     }
 

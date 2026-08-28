@@ -19,6 +19,10 @@ exists. Do not describe the artifact as signed or ARM64-capable.
 From the repository root on Windows with the MSVC Rust toolchain:
 
 ```powershell
+cargo test --locked
+```
+
+```powershell
 .\packaging\package.ps1
 .\packaging\validate.ps1 -Archive .\artifacts\taskbar-groups-v0.1.0-x86_64-pc-windows-msvc.zip
 ```
@@ -52,5 +56,12 @@ appropriate. The validator exercises clean extraction, preservation of a
 configuration sentinel during upgrade, and complete removal of the install
 folder during uninstall.
 
-The workflow runs on Windows, where the MSVC linker and Windows SDK are
-available. Validation requires only PowerShell and .NET ZIP support.
+The workflow runs on pull requests and relevant pushes to `master`, on Windows
+where the MSVC linker and Windows SDK are available. It runs locked tests and a
+locked release build, requires exactly one expected x64 MSVC ZIP, then checks
+version/target/provenance metadata, the manifest SHA-256, required runtime
+layout, forbidden files, and clean install/upgrade/uninstall behavior. It also
+checks that a tampered manifest is rejected. Validation requires only
+PowerShell and .NET ZIP support.
+
+There is no installer, signing step, or ARM64 package in this contract.
