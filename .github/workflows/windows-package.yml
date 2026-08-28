@@ -1,0 +1,37 @@
+name: Windows package
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: windows-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@1.97.1
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Build portable package
+        shell: pwsh
+        run: .\packaging\package.ps1
+
+      - name: Validate package
+        shell: pwsh
+        run: .\packaging\validate.ps1 -Archive (Get-ChildItem .\artifacts\*.zip | Select-Object -First 1).FullName
+
+      - name: Upload versioned artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: taskbar-groups-windows-msvc
+          path: artifacts/*.zip
+          if-no-files-found: error
