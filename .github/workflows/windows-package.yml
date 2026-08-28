@@ -27,7 +27,14 @@ jobs:
 
       - name: Validate package
         shell: pwsh
-        run: .\packaging\validate.ps1 -Archive (Get-ChildItem .\artifacts\*.zip | Select-Object -First 1).FullName
+        run: .\packaging\validate.ps1 -Archive (Get-ChildItem .\artifacts\*.zip | Select-Object -First 1).FullName -Manifest .\artifacts\manifest.json
+
+      - name: Upload release manifest
+        uses: actions/upload-artifact@v4
+        with:
+          name: taskbar-groups-windows-msvc-manifest
+          path: artifacts/manifest.json
+          if-no-files-found: error
 
       - name: Upload versioned artifact
         uses: actions/upload-artifact@v4

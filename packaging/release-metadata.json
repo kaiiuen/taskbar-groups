@@ -1,0 +1,26 @@
+{
+  "schemaVersion": 1,
+  "product": "taskbar-groups",
+  "version": "0.1.0",
+  "source": {
+    "repository": "https://github.com/kaiiuen/taskbar-groups",
+    "ref": "master"
+  },
+  "artifacts": {
+    "format": "zip",
+    "kind": "portable",
+    "signing": "not implemented",
+    "installer": "not implemented"
+  },
+  "architectures": {
+    "x86_64-pc-windows-msvc": {
+      "status": "supported",
+      "runner": "windows-latest"
+    },
+    "aarch64-pc-windows-msvc": {
+      "status": "not supported",
+      "reason": "No ARM64 build or validation path is implemented."
+    }
+  },
+  "runtimeLayout": ["config", "Shortcuts", "JITComp"]
+}
