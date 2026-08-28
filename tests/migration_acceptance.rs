@@ -199,31 +199,51 @@ fn failed_publish_leaves_no_partial_version_and_keeps_recovery_data() {
     let source = write_group(&legacy, "Failure", &category("Failure", "app.exe", "work"));
     let destination = tree.destination("destination");
     let plan = LegacyMigrationPlan::discover(&legacy, &destination).expect("discover source");
-    fs::remove_file(&source).expect("remove source after discovery");
+    fs::write(&destination, b"blocking file").expect("block destination publication");
 
     let error = plan.execute_with_backup().unwrap_err();
     assert!(matches!(error, MigrationError::Io { .. }));
     assert!(!destination.join("v1").exists());
-    assert!(
-        fs::read_dir(tree.0.as_path())
-            .expect("read disposable root")
-            .filter_map(Result::ok)
-            .all(|entry| {
-                let name = entry.file_name();
-                let name = name.to_string_lossy();
-                !name.starts_with(".migration-") || name.starts_with(".migration-backup-")
-            }),
-        "failed publication must clean its staging directory"
-    );
-    assert!(
-        fs::read_dir(tree.0.as_path())
-            .expect("read disposable root for backup")
-            .filter_map(Result::ok)
-            .any(|entry| entry
+    let recovery_artifacts = fs::read_dir(tree.0.as_path())
+        .expect("read disposable root for recovery artifacts")
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            entry
                 .file_name()
                 .to_string_lossy()
-                .starts_with(".migration-backup-")),
-        "automatic backup must remain available after a failed publish"
+                .starts_with(".migration-backup-")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        recovery_artifacts.len(),
+        1,
+        "failed publication must leave exactly one automatic backup"
+    );
+    let backup_source = recovery_artifacts[0]
+        .path()
+        .join("Failure")
+        .join("ObjectData.xml");
+    assert_eq!(
+        fs::read_to_string(backup_source).expect("read automatic backup"),
+        category("Failure", "app.exe", "work").to_legacy_xml(),
+        "automatic backup must preserve the source needed for recovery"
+    );
+    assert!(
+        source.is_file(),
+        "failed publication must preserve its source"
+    );
+    let staging_artifacts = fs::read_dir(tree.0.as_path())
+        .expect("read disposable root for staging artifacts")
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            name.starts_with(".migration-") && !name.starts_with(".migration-backup-")
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        staging_artifacts.is_empty(),
+        "failed publication must clean its staging directory: {staging_artifacts:?}"
     );
 }
 

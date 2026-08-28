@@ -42,7 +42,8 @@ mod windows {
 
     fn unique_name(label: &str) -> Vec<u16> {
         let nonce = NEXT_NAME.fetch_add(1, Ordering::Relaxed);
-        format!("Local\\TaskbarGroups.Acceptance.{label}.{nonce}")
+        let process = std::process::id();
+        format!("Local\\TaskbarGroups.Acceptance.{label}.{process}.{nonce}")
             .encode_utf16()
             .chain(Some(0))
             .collect()
