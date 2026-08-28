@@ -12,7 +12,10 @@ use std::{fs, io};
 use crate::{
     domain::{Category, ProgramShortcut, ValidationError, MAX_SHORTCUTS},
     persistence::AppPaths,
-    platform::{LaunchPlanner, LaunchRequest, LaunchTrigger, PassthroughResolver, ShortcutNumber},
+    platform::{
+        windows_apps::WindowsApp, LaunchPlanner, LaunchRequest, LaunchTrigger, PassthroughResolver,
+        ShortcutNumber,
+    },
 };
 
 pub use shell::{TemporaryShell, UiShell};
@@ -30,6 +33,7 @@ pub enum Action {
     BeginNewGroup,
     EditGroup(String),
     AddShortcut { path: String, is_windows_app: bool },
+    SelectWindowsApp(WindowsApp),
     RemoveShortcut(usize),
     MoveShortcut { from: usize, to: usize },
     SelectShortcut(Option<usize>),
@@ -154,6 +158,7 @@ impl<S: UiShell> Controller<S> {
                 path,
                 is_windows_app,
             } => self.add_shortcut(path, is_windows_app),
+            Action::SelectWindowsApp(app) => self.select_windows_app(app),
             Action::RemoveShortcut(index) => self.remove_shortcut(index),
             Action::MoveShortcut { from, to } => self.move_shortcut(from, to),
             Action::SelectShortcut(index) => self.select(index),
@@ -239,6 +244,35 @@ impl<S: UiShell> Controller<S> {
                 let mut shortcut = ProgramShortcut::new(path);
                 shortcut.is_windows_app = is_windows_app;
                 group.shortcut_list.push(shortcut);
+            }
+        });
+        if self
+            .view
+            .editor
+            .as_ref()
+            .is_some_and(|g| g.shortcut_list.len() >= MAX_SHORTCUTS)
+        {
+            self.view.notice = Some(format!(
+                "A group can contain at most {MAX_SHORTCUTS} shortcuts"
+            ));
+        }
+    }
+    fn select_windows_app(&mut self, app: WindowsApp) {
+        let icon_candidate = app.icon_candidates.first().cloned();
+        self.update_editor(|group| {
+            if group.shortcut_list.len() < MAX_SHORTCUTS {
+                let mut shortcut = ProgramShortcut::new(app.aumid.clone());
+                shortcut.is_windows_app = true;
+                shortcut.name = app.display_name.clone();
+                group.shortcut_list.push(shortcut);
+                // Keep an app-provided icon identity only when the user has not
+                // explicitly selected a group icon. Persistence and asset
+                // extraction remain responsible for deciding whether it is usable.
+                if group.icon_source.is_none() {
+                    if let Some(path) = icon_candidate {
+                        group.icon_source = Some(crate::domain::GroupIconSource { path, index: 0 });
+                    }
+                }
             }
         });
         if self
@@ -465,6 +499,33 @@ mod tests {
             "--safe"
         );
     }
+    #[test]
+    fn selected_windows_app_becomes_persistable_shortcut() {
+        let mut c = controller();
+        c.dispatch(Action::BeginNewGroup);
+        let app = WindowsApp::new(
+            "Calculator",
+            "Microsoft.WindowsCalculator_8wekyb3d8bbwe!App",
+        )
+        .unwrap();
+        c.dispatch(Action::SelectWindowsApp(app.clone()));
+        let shortcut = &c.view().editor.as_ref().unwrap().shortcut_list[0];
+        assert_eq!(shortcut.file_path, app.aumid);
+        assert!(shortcut.is_windows_app);
+        assert_eq!(shortcut.name, "Calculator");
+        assert_eq!(
+            c.view()
+                .editor
+                .as_ref()
+                .unwrap()
+                .icon_source
+                .as_ref()
+                .unwrap()
+                .path,
+            app.icon_candidates[0]
+        );
+    }
+
     #[test]
     fn rejects_more_than_twenty_shortcuts() {
         let mut c = controller();

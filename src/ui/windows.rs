@@ -4,6 +4,7 @@
 //! launch planning remain in `ui::Controller` and the existing platform boundary.
 
 use super::Action;
+use crate::platform::windows_apps::WindowsApp;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum NativeEvent {
@@ -14,6 +15,7 @@ pub enum NativeEvent {
     SaveGroup,
     Cancel,
     AddShortcut { path: String, is_windows_app: bool },
+    SelectWindowsApp(WindowsApp),
     RemoveShortcut(usize),
     MoveShortcut { from: usize, to: usize },
     SelectShortcut(Option<usize>),
@@ -45,6 +47,7 @@ pub fn action_for_event(event: NativeEvent) -> Action {
             path,
             is_windows_app,
         },
+        NativeEvent::SelectWindowsApp(app) => Action::SelectWindowsApp(app),
         NativeEvent::RemoveShortcut(index) => Action::RemoveShortcut(index),
         NativeEvent::MoveShortcut { from, to } => Action::MoveShortcut { from, to },
         NativeEvent::SelectShortcut(index) => Action::SelectShortcut(index),
@@ -67,7 +70,10 @@ mod native {
     use super::{action_for_event, NativeEvent};
     use crate::{
         persistence::AppPaths,
-        platform::{LaunchRequest, LaunchSpec, Launcher, WindowsPlatform},
+        platform::{
+            windows_apps::{WindowsApp, WindowsAppDiscovery, WindowsShellAppDiscovery},
+            LaunchRequest, LaunchSpec, Launcher, WindowsPlatform,
+        },
         ui::{Controller, UiShell},
     };
     use std::{
@@ -113,6 +119,8 @@ mod native {
     const WIDTH: i32 = 119;
     const OPACITY: i32 = 120;
     const LAUNCH: i32 = 121;
+    const DISCOVER_APPS: i32 = 126;
+    const APPS: i32 = 127;
     const VK_CONTROL_KEY: i32 = 0x11;
     const BST_UNCHECKED_VALUE: usize = 0;
     const BST_CHECKED_VALUE: usize = 1;
@@ -203,6 +211,7 @@ mod native {
         group_name: HWND,
         icon: HWND,
         shortcuts: HWND,
+        apps: HWND,
         shortcut_path: HWND,
         shortcut_name: HWND,
         arguments: HWND,
@@ -212,6 +221,7 @@ mod native {
         width: HWND,
         opacity: HWND,
         updating: bool,
+        discovered_apps: Vec<WindowsApp>,
     }
 
     pub fn run(request: LaunchRequest, paths: AppPaths) -> io::Result<()> {
@@ -313,6 +323,18 @@ mod native {
         button(hwnd, "New group", 16, 12, 110, 24, NEW);
         button(hwnd, "Edit selected", 136, 12, 110, 24, EDIT);
         button(hwnd, "Add shortcut", 290, 455, 110, 26, ADD);
+        button(hwnd, "Discover apps", 700, 455, 110, 26, DISCOVER_APPS);
+        let apps = control(
+            "LISTBOX",
+            "",
+            WS_CHILD | WS_VISIBLE | WS_BORDER | LBS_NOTIFY as u32 | WS_VSCROLL,
+            700,
+            195,
+            125,
+            140,
+            hwnd,
+            APPS,
+        );
         button(hwnd, "Browse files", 290, 428, 110, 24, BROWSE_FILES);
         button(hwnd, "Browse folder", 410, 428, 110, 24, BROWSE_FOLDER);
         button(hwnd, "Import files", 530, 428, 110, 24, IMPORT_FILES);
@@ -331,6 +353,7 @@ mod native {
             group_name,
             icon,
             shortcuts,
+            apps,
             shortcut_path,
             shortcut_name,
             arguments,
@@ -340,6 +363,7 @@ mod native {
             width,
             opacity,
             updating: false,
+            discovered_apps: Vec::new(),
         }
     }
 
@@ -511,6 +535,9 @@ mod native {
             SHORTCUTS if notification == LBN_SELCHANGE => {
                 selected(ui.shortcuts).map(|index| NativeEvent::SelectShortcut(Some(index)))
             }
+            APPS if notification == LBN_DBLCLK => selected(ui.apps)
+                .and_then(|index| ui.discovered_apps.get(index).cloned())
+                .map(NativeEvent::SelectWindowsApp),
             _ => None,
         };
         if let Some(event) = event {
@@ -540,6 +567,25 @@ mod native {
         } else if id == BROWSE_ICON {
             if let Some(path) = choose_files(ui.hwnd, false).and_then(|mut paths| paths.pop()) {
                 dispatch(ui, NativeEvent::Icon(path));
+            }
+        } else if id == DISCOVER_APPS {
+            match WindowsShellAppDiscovery.enumerate() {
+                Ok(apps) => {
+                    ui.discovered_apps = apps;
+                    unsafe { SendMessageW(ui.apps, LB_RESETCONTENT, 0, 0) };
+                    for app in &ui.discovered_apps {
+                        let value = wide(&format!("{} — {}", app.display_name, app.aumid));
+                        unsafe {
+                            SendMessageW(ui.apps, LB_ADDSTRING, 0, value.as_ptr() as LPARAM);
+                        }
+                    }
+                    if ui.discovered_apps.is_empty() {
+                        ui.controller
+                            .shell_mut()
+                            .show_message("No Windows apps were discovered.");
+                    }
+                }
+                Err(error) => ui.controller.shell_mut().show_error(&error.to_string()),
             }
         }
     }
@@ -841,6 +887,7 @@ pub fn run(
 
 #[cfg(all(test, windows))]
 mod smoke_tests {
+    use super::*;
     use windows_sys::Win32::UI::WindowsAndMessaging::GetDesktopWindow;
 
     #[test]
@@ -850,6 +897,16 @@ mod smoke_tests {
             return;
         }
         assert!(!desktop.is_null());
+    }
+
+    #[test]
+    fn discovered_app_selection_is_safe_without_launching() {
+        let app = WindowsApp::new("Test", "Example.App_123!App").unwrap();
+        assert_eq!(app.launch_target, "shell:AppsFolder\\Example.App_123!App");
+        assert!(matches!(
+            action_for_event(NativeEvent::SelectWindowsApp(app)),
+            Action::SelectWindowsApp(_)
+        ));
     }
 }
 
@@ -879,6 +936,15 @@ mod tests {
             Action::SetWorkingDirectory("C:\\Games".into())
         );
     }
+    #[test]
+    fn maps_discovered_apps_to_existing_actions() {
+        let app = WindowsApp::new("Calculator", "Example.Calculator_123!App").unwrap();
+        assert_eq!(
+            action_for_event(NativeEvent::SelectWindowsApp(app.clone())),
+            Action::SelectWindowsApp(app)
+        );
+    }
+
     #[test]
     fn maps_native_file_workflows_to_existing_actions() {
         assert_eq!(
