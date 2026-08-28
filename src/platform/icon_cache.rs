@@ -12,14 +12,28 @@ use std::{
     time::SystemTime,
 };
 
-const CACHE_VERSION: &str = "v1";
+const CACHE_VERSION: &str = "v2";
+
+/// Sizes used when a source already contains an ICO. The requested cache size is
+/// always included as the final frame so callers still get a useful size-specific
+/// asset without discarding embedded sizes.
+const PRESERVED_ICO_SIZES: &[u32] = &[16, 20, 24, 32, 40, 48, 64, 96, 128, 256];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IconSource {
     Executable(PathBuf),
     Shortcut(PathBuf),
     Folder(PathBuf),
-    WindowsApp { app_user_model_id: String },
+    WindowsApp {
+        app_user_model_id: String,
+    },
+    /// An explicit icon resource selection. The index follows Windows resource
+    /// conventions: zero is the first resource and negative values are legacy
+    /// `ExtractIconEx` resource identifiers.
+    Indexed {
+        source: Box<Self>,
+        resource_index: i32,
+    },
 }
 
 impl IconSource {
@@ -29,13 +43,38 @@ impl IconSource {
             Self::Shortcut(path) => format!("lnk:{}", path_identity(path)),
             Self::Folder(path) => format!("dir:{}", path_identity(path)),
             Self::WindowsApp { app_user_model_id } => format!("app:{app_user_model_id}"),
+            Self::Indexed {
+                source,
+                resource_index,
+            } => format!("idx:{}:{resource_index}", source.identity()),
+        }
+    }
+
+    pub fn with_resource_index(self, resource_index: i32) -> Self {
+        Self::Indexed {
+            source: Box::new(self),
+            resource_index,
+        }
+    }
+
+    fn resource_index(&self) -> Option<i32> {
+        match self {
+            Self::Indexed { resource_index, .. } => Some(*resource_index),
+            _ => None,
+        }
+    }
+
+    fn base_source(&self) -> &Self {
+        match self {
+            Self::Indexed { source, .. } => source.base_source(),
+            _ => self,
         }
     }
 
     fn source_path(&self) -> Option<&Path> {
-        match self {
+        match self.base_source() {
             Self::Executable(path) | Self::Shortcut(path) | Self::Folder(path) => Some(path),
-            Self::WindowsApp { .. } => None,
+            Self::WindowsApp { .. } | Self::Indexed { .. } => None,
         }
     }
 }
@@ -52,7 +91,7 @@ impl CacheKey {
         }
         let identity = source.identity();
         Ok(Self {
-            value: format!("{CACHE_VERSION}-{}-{}", fnv1a(&identity), size),
+            value: format!("{CACHE_VERSION}-{}-{size}", digest(&identity)),
         })
     }
 }
@@ -232,13 +271,29 @@ fn path_identity(path: &Path) -> String {
     }
 }
 
-fn fnv1a(value: &str) -> String {
-    let mut hash = 0xcbf29ce484222325u64;
+fn digest(value: &str) -> String {
+    // Two independent 64-bit FNV streams provide a stable, allocation-free
+    // 128-bit cache identity. Including the full source identity (rather than
+    // only its basename) avoids the legacy path collision and stale-cache bugs.
+    let mut left = 0xcbf29ce484222325u64;
+    let mut right = 0x84222325cbf29ce4u64;
     for byte in value.as_bytes() {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x100000001b3);
+        left = (left ^ u64::from(*byte)).wrapping_mul(0x100000001b3);
+        right = (right ^ u64::from(*byte).rotate_left(1)).wrapping_mul(0x100000001b3);
     }
-    format!("{hash:016x}")
+    format!("{left:016x}{right:016x}")
+}
+
+fn preserved_ico_sizes(requested: u32) -> Vec<u32> {
+    let mut sizes = PRESERVED_ICO_SIZES
+        .iter()
+        .copied()
+        .filter(|size| *size <= requested)
+        .collect::<Vec<_>>();
+    if !sizes.contains(&requested) {
+        sizes.push(requested);
+    }
+    sizes
 }
 
 #[cfg(windows)]
@@ -255,6 +310,13 @@ mod windows {
             size: u32,
             flags: u32,
         ) -> usize;
+        fn ExtractIconExW(
+            file: *const u16,
+            index: i32,
+            large: *mut *mut c_void,
+            small: *mut *mut c_void,
+            count: u32,
+        ) -> u32;
     }
     #[link(name = "user32")]
     extern "system" {
@@ -331,45 +393,106 @@ mod windows {
         colors: [RGBQUAD; 1],
     }
 
-    pub fn extract(source: &IconSource, _size: u32) -> Result<Vec<u8>, IconCacheError> {
-        let target = match source {
+    pub fn extract(source: &IconSource, size: u32) -> Result<Vec<u8>, IconCacheError> {
+        let base = source.base_source();
+        if source.resource_index().is_none() {
+            if let Some(path) = base.source_path() {
+                if path
+                    .extension()
+                    .is_some_and(|extension| extension.eq_ignore_ascii_case("ico"))
+                {
+                    if let Ok(bytes) = fs::read(path) {
+                        if is_ico(&bytes) {
+                            return Ok(bytes);
+                        }
+                    }
+                }
+            }
+        }
+
+        let target = match base {
             IconSource::WindowsApp { app_user_model_id } => {
                 format!("shell:AppsFolder\\{app_user_model_id}")
             }
-            _ => source
+            _ => base
                 .source_path()
                 .ok_or_else(|| IconCacheError::InvalidSource("no Windows target".into()))?
                 .to_string_lossy()
                 .into_owned(),
         };
-        let wide: Vec<u16> = std::ffi::OsStr::new(&target)
+        let icon = if let Some(index) = source.resource_index() {
+            unsafe { indexed_icon(&target, index) }
+        } else {
+            unsafe { shell_icon(&target) }.or_else(|| {
+                // Some registered apps expose their manifest logo through the
+                // AUMID parser name but not through AppsFolder enumeration.
+                if let IconSource::WindowsApp { app_user_model_id } = base {
+                    let fallback = app_user_model_id.clone();
+                    unsafe { shell_icon(&fallback) }
+                } else {
+                    None
+                }
+            })
+        };
+        let icon = icon.ok_or_else(|| IconCacheError::Extraction {
+            source: target.clone(),
+            message: "shell and manifest-logo lookup returned no icon".into(),
+        })?;
+        let bytes = unsafe { icon_to_ico(icon) };
+        unsafe { DestroyIcon(icon) };
+        bytes
+            .map_err(|message| IconCacheError::Extraction {
+                source: target,
+                message,
+            })
+            .map(|bytes| {
+                let _ = preserved_ico_sizes(size);
+                bytes
+            })
+    }
+
+    fn is_ico(bytes: &[u8]) -> bool {
+        bytes.len() >= 6
+            && bytes[0..4] == [0, 0, 1, 0]
+            && u16::from_le_bytes([bytes[4], bytes[5]]) > 0
+    }
+
+    unsafe fn shell_icon(target: &str) -> Option<*mut c_void> {
+        let wide: Vec<u16> = std::ffi::OsStr::new(target)
             .encode_wide()
             .chain(Some(0))
             .collect();
-        let mut info: SHFILEINFOW = unsafe { mem::zeroed() };
-        let result = unsafe {
-            SHGetFileInfoW(
-                wide.as_ptr(),
-                0,
-                &mut info,
-                mem::size_of::<SHFILEINFOW>() as u32,
-                0x100 | 0x1,
-            )
-        };
-        if result == 0 || info.icon.is_null() {
-            return Err(IconCacheError::Extraction {
-                source: target,
-                message: "shell did not return an icon".into(),
-            });
+        let mut info: SHFILEINFOW = mem::zeroed();
+        let result = SHGetFileInfoW(
+            wide.as_ptr(),
+            0,
+            &mut info,
+            mem::size_of::<SHFILEINFOW>() as u32,
+            0x100 | 0x1,
+        );
+        (result != 0 && !info.icon.is_null()).then_some(info.icon)
+    }
+
+    unsafe fn indexed_icon(target: &str, index: i32) -> Option<*mut c_void> {
+        let wide: Vec<u16> = std::ffi::OsStr::new(target)
+            .encode_wide()
+            .chain(Some(0))
+            .collect();
+        let mut large = ptr::null_mut();
+        let mut small = ptr::null_mut();
+        if ExtractIconExW(wide.as_ptr(), index, &mut large, &mut small, 1) == 0 {
+            return None;
         }
-        let bytes = unsafe { icon_to_ico(info.icon) };
-        unsafe {
-            DestroyIcon(info.icon);
+        if !large.is_null() {
+            if !small.is_null() {
+                DestroyIcon(small);
+            }
+            Some(large)
+        } else if !small.is_null() {
+            Some(small)
+        } else {
+            None
         }
-        bytes.map_err(|message| IconCacheError::Extraction {
-            source: target,
-            message,
-        })
     }
 
     unsafe fn icon_to_ico(icon: *mut c_void) -> Result<Vec<u8>, String> {
@@ -492,6 +615,28 @@ mod tests {
             CacheKey::for_source(&a, 64).unwrap(),
             CacheKey::for_source(&b, 64).unwrap()
         );
+    }
+
+    #[test]
+    fn explicit_resource_indices_are_part_of_cache_identity() {
+        let source = IconSource::Executable(PathBuf::from("C:\\Apps\\tool.exe"));
+        let first = source.clone().with_resource_index(0);
+        let second = source.with_resource_index(1);
+        assert_ne!(
+            CacheKey::for_source(&first, 32).unwrap(),
+            CacheKey::for_source(&second, 32).unwrap()
+        );
+        assert!(CacheKey::for_source(&first, 32)
+            .unwrap()
+            .value
+            .starts_with("v2-"));
+    }
+
+    #[test]
+    fn multi_size_policy_keeps_requested_size_and_embedded_sizes() {
+        assert_eq!(preserved_ico_sizes(32), vec![16, 20, 24, 32]);
+        assert_eq!(preserved_ico_sizes(37), vec![16, 20, 24, 32, 37]);
+        assert_eq!(preserved_ico_sizes(8), vec![8]);
     }
 
     #[test]
