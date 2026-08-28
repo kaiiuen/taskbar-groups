@@ -282,6 +282,28 @@ pub fn action_for_event(event: NativeEvent) -> Action {
     }
 }
 
+const ACTIVATION_VERSION: u16 = 1;
+
+fn encode_activation(group_name: Option<&str>) -> Vec<u16> {
+    let mut payload = vec![ACTIVATION_VERSION, group_name.is_some() as u16];
+    payload.extend(group_name.unwrap_or_default().encode_utf16());
+    payload.push(0);
+    payload
+}
+
+fn decode_activation(payload: &[u16]) -> Option<Option<String>> {
+    if payload.len() < 3 || payload[0] != ACTIVATION_VERSION || payload[1] > 1 {
+        return None;
+    }
+    let value = payload[2..].split(|unit| *unit == 0).next()?;
+    let value = String::from_utf16(value).ok()?;
+    match payload[1] {
+        0 if value.is_empty() => Some(None),
+        1 if !value.is_empty() => Some(Some(value)),
+        _ => None,
+    }
+}
+
 #[cfg(windows)]
 mod native {
     use super::{
@@ -300,10 +322,11 @@ mod native {
         io,
         os::windows::ffi::OsStrExt,
         path::{Path, PathBuf},
-        ptr,
+        ptr, thread,
+        time::Duration,
     };
     use windows_sys::Win32::{
-        Foundation::{CloseHandle, GetLastError, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM},
+        Foundation::{CloseHandle, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM},
         Graphics::Gdi::{
             GetMonitorInfoW, MonitorFromWindow, COLOR_WINDOW, MONITORINFO, MONITOR_DEFAULTTONEAREST,
         },
@@ -357,7 +380,16 @@ mod native {
     const COPYDATA_GROUP: usize = 1;
     const SWP_NOACTIVATE: u32 = 0x0010;
     const SWP_NOZORDER: u32 = 0x0004;
-    const ERROR_ALREADY_EXISTS: u32 = 183;
+    const WAIT_OBJECT_0_VALUE: u32 = 0;
+    const WAIT_ABANDONED_VALUE: u32 = 0x0000_0080;
+    const WAIT_TIMEOUT_VALUE: u32 = 0x0000_0102;
+    const SMTO_ABORTIFHUNG_VALUE: u32 = 0x0002;
+    const ACTIVATION_RETRIES: usize = 40;
+    const ACTIVATION_RETRY_DELAY: Duration = Duration::from_millis(25);
+    const EDITOR_MUTEX: &str = "Local\\TaskbarGroups.Editor";
+    const FLYOUT_MUTEX: &str = "Local\\TaskbarGroups.Flyout";
+    const EDITOR_CLASS: &str = "TaskbarGroupsEditorUi";
+    const FLYOUT_CLASS: &str = "TaskbarGroupsFlyoutUi";
     const DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2: isize = -4;
     const ABM_GETSTATE_VALUE: u32 = 0x0000_0004;
     const ABM_GETTASKBARPOS_VALUE: u32 = 0x0000_0005;
@@ -377,6 +409,8 @@ mod native {
             initial_owner: i32,
             name: *const u16,
         ) -> isize;
+        fn ReleaseMutex(mutex: isize) -> i32;
+        fn WaitForSingleObject(handle: isize, milliseconds: u32) -> u32;
     }
 
     #[link(name = "ole32")]
@@ -387,6 +421,15 @@ mod native {
     #[link(name = "user32")]
     unsafe extern "system" {
         fn SetProcessDpiAwarenessContext(value: isize) -> i32;
+        fn SendMessageTimeoutW(
+            hwnd: HWND,
+            message: u32,
+            wparam: WPARAM,
+            lparam: LPARAM,
+            flags: u32,
+            timeout: u32,
+            result: *mut usize,
+        ) -> LRESULT;
     }
 
     #[repr(C)]
@@ -484,22 +527,56 @@ mod native {
         discovered_apps: Vec<WindowsApp>,
     }
 
-    pub fn run(request: LaunchRequest, paths: AppPaths) -> io::Result<()> {
-        let mutex_name = wide("Local\\TaskbarGroupsNativeUi");
-        let mutex = unsafe { CreateMutexW(ptr::null(), 1, mutex_name.as_ptr()) };
+    struct InstanceGuard(isize);
+
+    impl Drop for InstanceGuard {
+        fn drop(&mut self) {
+            unsafe {
+                ReleaseMutex(self.0);
+                CloseHandle(self.0 as _);
+            }
+        }
+    }
+
+    fn instance_identity(group_name: Option<&str>) -> (&'static str, &'static str) {
+        if group_name.is_some() {
+            (FLYOUT_MUTEX, FLYOUT_CLASS)
+        } else {
+            (EDITOR_MUTEX, EDITOR_CLASS)
+        }
+    }
+
+    fn acquire_instance(group_name: Option<&str>) -> io::Result<Option<InstanceGuard>> {
+        let (mutex_name, _) = instance_identity(group_name);
+        let name = wide(mutex_name);
+        let mutex = unsafe { CreateMutexW(ptr::null(), 0, name.as_ptr()) };
         if mutex == 0 {
             return Err(io::Error::last_os_error());
         }
-        if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
-            let result = forward_activation(request.group_name.as_deref());
-            unsafe { CloseHandle(mutex as _) };
-            return result;
+        match unsafe { WaitForSingleObject(mutex, 0) } {
+            WAIT_OBJECT_0_VALUE | WAIT_ABANDONED_VALUE => Ok(Some(InstanceGuard(mutex))),
+            WAIT_TIMEOUT_VALUE => {
+                unsafe { CloseHandle(mutex as _) };
+                Ok(None)
+            }
+            _ => {
+                let error = io::Error::last_os_error();
+                unsafe { CloseHandle(mutex as _) };
+                Err(error)
+            }
         }
+    }
+
+    pub fn run(request: LaunchRequest, paths: AppPaths) -> io::Result<()> {
+        let (_, class_name) = instance_identity(request.group_name.as_deref());
+        let Some(_instance) = acquire_instance(request.group_name.as_deref())? else {
+            return forward_activation(class_name, request.group_name.as_deref());
+        };
 
         // Per-monitor V2 keeps client coordinates and common controls scaled on
         // mixed-DPI desktops. It must be selected before creating any windows.
         unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
-        let class = wide("TaskbarGroupsNativeUi");
+        let class = wide(class_name);
         let instance = unsafe { GetModuleHandleW(ptr::null()) } as HINSTANCE;
         let wc = WNDCLASSW {
             style: CS_HREDRAW | CS_VREDRAW,
@@ -511,7 +588,6 @@ mod native {
             ..unsafe { std::mem::zeroed() }
         };
         if unsafe { RegisterClassW(&wc) } == 0 {
-            unsafe { CloseHandle(mutex as _) };
             return Err(io::Error::last_os_error());
         }
         let hwnd = unsafe {
@@ -519,7 +595,7 @@ mod native {
                 0,
                 class.as_ptr(),
                 wide("Taskbar Groups").as_ptr(),
-                WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+                WS_OVERLAPPEDWINDOW,
                 CW_USEDEFAULT,
                 CW_USEDEFAULT,
                 860,
@@ -531,7 +607,6 @@ mod native {
             )
         };
         if hwnd.is_null() {
-            unsafe { CloseHandle(mutex as _) };
             return Err(io::Error::last_os_error());
         }
         place_on_work_area(hwnd);
@@ -543,8 +618,8 @@ mod native {
         render(&mut ui);
         unsafe {
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(ui) as isize);
-        }
-        unsafe {
+            ShowWindow(hwnd, SW_SHOW);
+            SetForegroundWindow(hwnd);
             let mut message = std::mem::zeroed();
             while GetMessageW(&mut message, ptr::null_mut(), 0, 0) > 0 {
                 if IsDialogMessageW(hwnd, &mut message) != 0 {
@@ -554,27 +629,51 @@ mod native {
                 DispatchMessageW(&message);
             }
         }
-        unsafe { CloseHandle(mutex as _) };
         Ok(())
     }
 
-    fn forward_activation(group_name: Option<&str>) -> io::Result<()> {
-        let class = wide("TaskbarGroupsNativeUi");
-        let hwnd = unsafe { FindWindowW(class.as_ptr(), ptr::null()) };
+    fn forward_activation(class_name: &str, group_name: Option<&str>) -> io::Result<()> {
+        let class = wide(class_name);
+        let mut hwnd = ptr::null_mut();
+        for _ in 0..ACTIVATION_RETRIES {
+            hwnd = unsafe { FindWindowW(class.as_ptr(), ptr::null()) };
+            if !hwnd.is_null() {
+                break;
+            }
+            thread::sleep(ACTIVATION_RETRY_DELAY);
+        }
         if hwnd.is_null() {
             return Err(io::Error::new(
-                io::ErrorKind::Other,
-                "the existing Taskbar Groups window could not be found",
+                io::ErrorKind::NotFound,
+                "the existing Taskbar Groups window was not ready for activation",
             ));
         }
-        let payload = wide(group_name.unwrap_or(""));
+        let payload = super::encode_activation(group_name);
         let copy = CopyData {
             data: COPYDATA_GROUP,
             length: (payload.len() * std::mem::size_of::<u16>()) as u32,
             pointer: payload.as_ptr() as *const _,
         };
+        let mut result = 0usize;
+        let delivered = unsafe {
+            SendMessageTimeoutW(
+                hwnd,
+                WM_COPYDATA,
+                0,
+                &copy as *const _ as LPARAM,
+                SMTO_ABORTIFHUNG_VALUE,
+                2_000,
+                &mut result,
+            )
+        };
+        if delivered == 0 || result == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "the existing Taskbar Groups window did not accept activation",
+            ));
+        }
         unsafe {
-            SendMessageW(hwnd, WM_COPYDATA, 0, &copy as *const _ as LPARAM);
+            ShowWindow(hwnd, SW_RESTORE);
             SetForegroundWindow(hwnd);
         }
         Ok(())
@@ -951,26 +1050,29 @@ mod native {
                 0
             }
             WM_COPYDATA => {
+                let mut accepted = false;
                 if let Some(copy) = (lparam as *const CopyData).as_ref() {
-                    if copy.data == COPYDATA_GROUP && copy.length >= 2 && !copy.pointer.is_null() {
+                    if copy.data == COPYDATA_GROUP
+                        && copy.length >= (3 * std::mem::size_of::<u16>()) as u32
+                        && copy.length % std::mem::size_of::<u16>() as u32 == 0
+                        && !copy.pointer.is_null()
+                    {
                         let units = copy.length as usize / std::mem::size_of::<u16>();
-                        let value = std::slice::from_raw_parts(copy.pointer as *const u16, units)
-                            .split(|unit| *unit == 0)
-                            .next()
-                            .map(String::from_utf16_lossy)
-                            .unwrap_or_default();
-                        if let Some(ui) =
-                            (GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut NativeUi).as_mut()
-                        {
-                            if value.is_empty() {
+                        let payload = std::slice::from_raw_parts(copy.pointer as *const u16, units);
+                        if let Some(group_name) = super::decode_activation(payload) {
+                            if let Some(ui) =
+                                (GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut NativeUi).as_mut()
+                            {
+                                if let Some(value) = group_name {
+                                    dispatch(ui, NativeEvent::EditGroup(value));
+                                }
                                 SetForegroundWindow(hwnd);
-                            } else {
-                                dispatch(ui, NativeEvent::EditGroup(value));
+                                accepted = true;
                             }
                         }
                     }
                 }
-                1
+                accepted as isize
             }
             WM_DROPFILES => {
                 if let Some(ui) = (GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut NativeUi).as_mut()
@@ -1500,6 +1602,27 @@ mod smoke_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn activation_codec_round_trips_editor_and_group_requests() {
+        for group in [None, Some("Games"), Some("中文 — Tools")] {
+            let encoded = encode_activation(group);
+            assert_eq!(decode_activation(&encoded), Some(group.map(str::to_owned)));
+        }
+    }
+
+    #[test]
+    fn activation_codec_rejects_truncated_or_invalid_payloads() {
+        let valid = encode_activation(Some("Games"));
+        assert_eq!(decode_activation(&valid[..2]), None);
+        let mut wrong_version = valid.clone();
+        wrong_version[0] = 2;
+        assert_eq!(decode_activation(&wrong_version), None);
+        let mut wrong_mode = valid;
+        wrong_mode[1] = 2;
+        assert_eq!(decode_activation(&wrong_mode), None);
+    }
+
     #[test]
     fn keyboard_events_are_portable_and_controller_friendly() {
         assert_eq!(keyboard_event('\u{1b}', false), Some(NativeEvent::Cancel));
