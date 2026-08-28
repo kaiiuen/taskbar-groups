@@ -126,6 +126,49 @@ fn clamp_position(position: i32, origin: i32, extent: i32, size: i32) -> i32 {
         .min(origin.saturating_add(extent).saturating_sub(size))
 }
 
+/// Infers the shell edge from a taskbar rectangle and its monitor bounds.
+///
+/// A taskbar that does not touch exactly one monitor edge is not treated as a
+/// usable taskbar. This keeps shell query failures and transient rectangles on
+/// the deterministic placement fallback.
+pub fn infer_taskbar_edge(monitor: WorkArea, taskbar: UiRect) -> Option<TaskbarEdge> {
+    let monitor_right = monitor.x.saturating_add(monitor.width.max(0));
+    let monitor_bottom = monitor.y.saturating_add(monitor.height.max(0));
+    let taskbar_right = taskbar.x.saturating_add(taskbar.width.max(0));
+    let taskbar_bottom = taskbar.y.saturating_add(taskbar.height.max(0));
+    if taskbar.width <= 0 || taskbar.height <= 0 {
+        return None;
+    }
+    let touches = [
+        (
+            taskbar.y <= monitor.y && taskbar_bottom < monitor_bottom,
+            TaskbarEdge::Top,
+        ),
+        (
+            taskbar_bottom >= monitor_bottom && taskbar.y > monitor.y,
+            TaskbarEdge::Bottom,
+        ),
+        (
+            taskbar.x <= monitor.x && taskbar_right < monitor_right,
+            TaskbarEdge::Left,
+        ),
+        (
+            taskbar_right >= monitor_right && taskbar.x > monitor.x,
+            TaskbarEdge::Right,
+        ),
+    ];
+    let mut edge = None;
+    for (matches, candidate) in touches {
+        if matches {
+            if edge.is_some() {
+                return None;
+            }
+            edge = Some(candidate);
+        }
+    }
+    edge
+}
+
 /// Computes client-area coordinates in logical pixels. The minimums keep every
 /// editor control reachable when a window is restored to a small work area.
 pub fn layout_for_client(width: i32, height: i32) -> UiLayout {
@@ -242,8 +285,8 @@ pub fn action_for_event(event: NativeEvent) -> Action {
 #[cfg(windows)]
 mod native {
     use super::{
-        action_for_event, keyboard_event, layout_for_client, place_flyout, NativeEvent, UiRect,
-        WorkArea,
+        action_for_event, infer_taskbar_edge, keyboard_event, layout_for_client, place_flyout,
+        NativeEvent, TaskbarRect, UiRect, WorkArea,
     };
     use crate::{
         persistence::AppPaths,
@@ -267,7 +310,10 @@ mod native {
         System::LibraryLoader::GetModuleHandleW,
         UI::{
             Input::KeyboardAndMouse::{GetKeyState, VK_ESCAPE, VK_MENU, VK_RETURN},
-            Shell::{DragAcceptFiles, DragFinish, DragQueryFileW, ShellExecuteW, HDROP},
+            Shell::{
+                DragAcceptFiles, DragFinish, DragQueryFileW, SHAppBarMessage, ShellExecuteW,
+                APPBARDATA, HDROP,
+            },
             WindowsAndMessaging::*,
         },
     };
@@ -313,6 +359,9 @@ mod native {
     const SWP_NOZORDER: u32 = 0x0004;
     const ERROR_ALREADY_EXISTS: u32 = 183;
     const DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2: isize = -4;
+    const ABM_GETSTATE_VALUE: u32 = 0x0000_0004;
+    const ABM_GETTASKBARPOS_VALUE: u32 = 0x0000_0005;
+    const ABS_AUTOHIDE_VALUE: usize = 0x0000_0001;
 
     #[repr(C)]
     struct CopyData {
@@ -545,22 +594,34 @@ mod native {
         }
         let work_width = (info.rcWork.right - info.rcWork.left).max(1);
         let work_height = (info.rcWork.bottom - info.rcWork.top).max(1);
+        let work_area = WorkArea {
+            x: info.rcWork.left,
+            y: info.rcWork.top,
+            width: work_width,
+            height: work_height,
+        };
         let width = 860.min(work_width);
         let height = 650.min(work_height);
-        let placement = place_flyout(
-            WorkArea {
-                x: info.rcWork.left,
-                y: info.rcWork.top,
-                width: work_width,
-                height: work_height,
-            },
-            None,
+        let monitor_area = UiRect {
+            x: info.rcMonitor.left,
+            y: info.rcMonitor.top,
+            width: (info.rcMonitor.right - info.rcMonitor.left).max(1),
+            height: (info.rcMonitor.bottom - info.rcMonitor.top).max(1),
+        };
+        let taskbar = query_taskbar(monitor, monitor_area);
+        let anchor = taskbar.map_or(
             (
                 info.rcWork.left + work_width / 2,
                 info.rcWork.top + work_height / 2 + height / 2 + 20,
             ),
-            (width, height),
+            |bar| {
+                (
+                    bar.rect.x + bar.rect.width / 2,
+                    bar.rect.y + bar.rect.height / 2,
+                )
+            },
         );
+        let placement = place_flyout(work_area, taskbar, anchor, (width, height));
         unsafe {
             SetWindowPos(
                 hwnd,
@@ -571,6 +632,87 @@ mod native {
                 placement.height,
                 SWP_NOZORDER | SWP_NOACTIVATE,
             );
+        }
+    }
+
+    pub(crate) fn query_taskbar(
+        monitor: *mut core::ffi::c_void,
+        monitor_area: UiRect,
+    ) -> Option<TaskbarRect> {
+        let mut appbar = APPBARDATA {
+            cbSize: std::mem::size_of::<APPBARDATA>() as u32,
+            ..unsafe { std::mem::zeroed() }
+        };
+        if unsafe { SHAppBarMessage(ABM_GETSTATE_VALUE, &mut appbar) } & ABS_AUTOHIDE_VALUE != 0 {
+            return None;
+        }
+
+        // ABM_GETTASKBARPOS is the supported query for the primary taskbar.
+        if unsafe { SHAppBarMessage(ABM_GETTASKBARPOS_VALUE, &mut appbar) } != 0
+            && !appbar.hWnd.is_null()
+            && unsafe { MonitorFromWindow(appbar.hWnd, MONITOR_DEFAULTTONEAREST) } == monitor
+        {
+            let rect = rect_to_ui(appbar.rc);
+            if let Some(edge) = infer_taskbar_edge(
+                WorkArea {
+                    x: monitor_area.x,
+                    y: monitor_area.y,
+                    width: monitor_area.width,
+                    height: monitor_area.height,
+                },
+                rect,
+            ) {
+                return Some(TaskbarRect { rect, edge });
+            }
+        }
+
+        // Secondary taskbars expose their monitor-specific rectangles through
+        // the documented shell window class rather than SHAppBarMessage.
+        let class = wide("Shell_SecondaryTrayWnd");
+        let mut previous = ptr::null_mut();
+        loop {
+            let taskbar =
+                unsafe { FindWindowExW(ptr::null_mut(), previous, class.as_ptr(), ptr::null()) };
+            if taskbar.is_null() {
+                break;
+            }
+            previous = taskbar;
+            if unsafe { IsWindowVisible(taskbar) } == 0
+                || unsafe { MonitorFromWindow(taskbar, MONITOR_DEFAULTTONEAREST) } != monitor
+            {
+                continue;
+            }
+            let mut rect = RECT {
+                left: 0,
+                top: 0,
+                right: 0,
+                bottom: 0,
+            };
+            if unsafe { GetWindowRect(taskbar, &mut rect) } == 0 {
+                continue;
+            }
+            let rect = rect_to_ui(rect);
+            if let Some(edge) = infer_taskbar_edge(
+                WorkArea {
+                    x: monitor_area.x,
+                    y: monitor_area.y,
+                    width: monitor_area.width,
+                    height: monitor_area.height,
+                },
+                rect,
+            ) {
+                return Some(TaskbarRect { rect, edge });
+            }
+        }
+        None
+    }
+
+    fn rect_to_ui(rect: RECT) -> UiRect {
+        UiRect {
+            x: rect.left,
+            y: rect.top,
+            width: rect.right.saturating_sub(rect.left),
+            height: rect.bottom.saturating_sub(rect.top),
         }
     }
 
@@ -1286,8 +1428,14 @@ pub fn run(
 
 #[cfg(all(test, windows))]
 mod smoke_tests {
+    use super::native::query_taskbar;
     use super::*;
-    use windows_sys::Win32::UI::WindowsAndMessaging::GetDesktopWindow;
+    use windows_sys::Win32::{
+        Graphics::Gdi::{
+            GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+        },
+        UI::WindowsAndMessaging::GetDesktopWindow,
+    };
 
     #[test]
     fn native_ui_smoke_skips_without_interactive_desktop() {
@@ -1296,6 +1444,46 @@ mod smoke_tests {
             return;
         }
         assert!(!desktop.is_null());
+    }
+
+    #[test]
+    fn taskbar_query_is_safe_without_an_interactive_shell() {
+        let desktop = unsafe { GetDesktopWindow() };
+        if desktop.is_null() {
+            return;
+        }
+        let monitor = unsafe { MonitorFromWindow(desktop, MONITOR_DEFAULTTONEAREST) };
+        if monitor.is_null() {
+            return;
+        }
+        let mut info = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..unsafe { std::mem::zeroed() }
+        };
+        if unsafe { GetMonitorInfoW(monitor, &mut info) } == 0 {
+            return;
+        }
+        let monitor_area = UiRect {
+            x: info.rcMonitor.left,
+            y: info.rcMonitor.top,
+            width: info.rcMonitor.right - info.rcMonitor.left,
+            height: info.rcMonitor.bottom - info.rcMonitor.top,
+        };
+        if let Some(taskbar) = query_taskbar(monitor, monitor_area) {
+            assert!(taskbar.rect.width > 0);
+            assert!(taskbar.rect.height > 0);
+            assert!(
+                infer_taskbar_edge(
+                    WorkArea {
+                        x: monitor_area.x,
+                        y: monitor_area.y,
+                        width: monitor_area.width,
+                        height: monitor_area.height,
+                    },
+                    taskbar.rect
+                ) == Some(taskbar.edge)
+            );
+        }
     }
 
     #[test]
@@ -1326,6 +1514,40 @@ mod tests {
         let large = layout_for_client(1400, 900);
         assert!(large.groups.width > small.groups.width);
         assert!(large.apps.x + large.apps.width <= 1400);
+    }
+
+    #[test]
+    fn taskbar_edge_inference_requires_a_single_monitor_edge() {
+        let monitor = WorkArea {
+            x: -1920,
+            y: 0,
+            width: 1920,
+            height: 1080,
+        };
+        assert_eq!(
+            infer_taskbar_edge(
+                monitor,
+                UiRect {
+                    x: -1920,
+                    y: 1040,
+                    width: 1920,
+                    height: 40,
+                }
+            ),
+            Some(TaskbarEdge::Bottom)
+        );
+        assert_eq!(
+            infer_taskbar_edge(
+                monitor,
+                UiRect {
+                    x: -1800,
+                    y: 100,
+                    width: 500,
+                    height: 40,
+                }
+            ),
+            None
+        );
     }
 
     #[test]
