@@ -1,3 +1,4 @@
+pub mod assets;
 pub mod domain;
 pub mod persistence;
 pub mod platform;

@@ -83,7 +83,36 @@ impl AppPaths {
 
     pub fn save_group(&self, category: &Category) -> io::Result<GroupPaths> {
         let group = self.group(&category.name)?;
+        #[cfg(windows)]
+        if category.icon_source.as_ref().is_some_and(|icon| {
+            let path = std::path::Path::new(&icon.path);
+            path.is_file() || path.is_dir()
+        }) {
+            let previous = group.load().ok();
+            crate::assets::GroupAssetStore::new(
+                crate::platform::icon_cache::PlatformIconExtractor,
+                32,
+            )
+            .map_err(asset_io_error)?
+            .synchronize(&group, category, previous.as_ref())
+            .map_err(asset_io_error)?;
+        }
         group.save(category)?;
+        Ok(group)
+    }
+
+    /// Persistence seam for portable tests and alternate platform adapters.
+    pub fn save_group_with_assets<E: crate::platform::icon_cache::IconExtractor>(
+        &self,
+        category: &Category,
+        store: &crate::assets::GroupAssetStore<E>,
+    ) -> Result<GroupPaths, SaveError> {
+        let group = self.group(&category.name).map_err(SaveError::Io)?;
+        let previous = group.load().ok();
+        store
+            .synchronize(&group, category, previous.as_ref())
+            .map_err(SaveError::Asset)?;
+        group.save(category).map_err(SaveError::Io)?;
         Ok(group)
     }
 
@@ -149,6 +178,26 @@ impl GroupPaths {
         fs::create_dir_all(&self.directory)?;
         fs::write(&self.object_data, category.to_legacy_xml())
     }
+}
+
+#[derive(Debug)]
+pub enum SaveError {
+    Io(io::Error),
+    Asset(crate::assets::AssetError),
+}
+
+impl std::fmt::Display for SaveError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Io(error) => error.fmt(f),
+            Self::Asset(error) => error.fmt(f),
+        }
+    }
+}
+impl std::error::Error for SaveError {}
+
+fn asset_io_error(error: crate::assets::AssetError) -> io::Error {
+    io::Error::new(ErrorKind::Other, error.to_string())
 }
 
 fn stored_group_name(name: &str) -> io::Result<String> {

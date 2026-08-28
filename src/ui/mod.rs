@@ -167,7 +167,12 @@ impl<S: UiShell> Controller<S> {
             Action::SetWidth(value) => self.update_editor(|g| g.width = value),
             Action::SetOpacity(value) => self.update_editor(|g| g.opacity = value),
             Action::SetAllowOpenAll(value) => self.update_editor(|g| g.allow_open_all = value),
-            Action::SetIcon { path } => self.view.icon_path = Some(path),
+            Action::SetIcon { path } => {
+                self.view.icon_path = Some(path.clone());
+                self.update_editor(|group| {
+                    group.icon_source = Some(crate::domain::GroupIconSource { path, index: 0 });
+                });
+            }
             Action::SaveGroup => self.save_group(),
             Action::DeleteGroup => self.delete_group(),
             Action::CancelEditor => {
@@ -216,9 +221,9 @@ impl<S: UiShell> Controller<S> {
         match self.paths.load_group(name) {
             Ok(category) => {
                 self.editing_existing = true;
+                self.view.icon_path = category.icon_source.as_ref().map(|icon| icon.path.clone());
                 self.view.editor = Some(category);
                 self.view.selected_shortcut = None;
-                self.view.icon_path = None;
             }
             Err(error) => {
                 self.view.error = Some(UiError::Load {
@@ -313,8 +318,9 @@ impl<S: UiShell> Controller<S> {
             self.fail(UiError::Validation(error));
             return;
         }
-        if self.view.icon_path.is_none() && self.editing_existing { /* Existing icon is retained by the native adapter. */
-        } else if self.view.icon_path.is_none() {
+        if group.icon_source.is_none() && self.editing_existing {
+            // Loading an older config without an icon remains supported.
+        } else if group.icon_source.is_none() {
             self.fail(UiError::Save("select a group icon".into()));
             return;
         }

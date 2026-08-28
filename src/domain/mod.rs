@@ -14,6 +14,8 @@ pub struct Category {
     pub shortcut_list: Vec<ProgramShortcut>,
     pub width: i32,
     pub opacity: f64,
+    /// Optional group icon selection retained in the legacy-compatible config.
+    pub icon_source: Option<GroupIconSource>,
 }
 
 impl Default for Category {
@@ -25,6 +27,7 @@ impl Default for Category {
             shortcut_list: Vec::new(),
             width: 0,
             opacity: DEFAULT_OPACITY,
+            icon_source: None,
         }
     }
 }
@@ -80,14 +83,17 @@ impl Category {
             .iter()
             .map(ProgramShortcut::to_legacy_xml)
             .collect::<String>();
+        let icon = self.icon_source.as_ref().map_or_else(String::new, |icon| {
+            format!(
+                "<IconPath>{}</IconPath><IconIndex>{}</IconIndex>",
+                escape_xml(&icon.path),
+                icon.index
+            )
+        });
         format!(
-            "<Category><Name>{}</Name><ColorString>{}</ColorString><allowOpenAll>{}</allowOpenAll><ShortcutList>{}</ShortcutList><Width>{}</Width><Opacity>{}</Opacity></Category>",
-            escape_xml(&self.name),
-            escape_xml(&self.color_string),
-            self.allow_open_all,
-            shortcuts,
-            self.width,
-            self.opacity
+            "<Category><Name>{}</Name><ColorString>{}</ColorString><allowOpenAll>{}</allowOpenAll><ShortcutList>{}</ShortcutList><Width>{}</Width><Opacity>{}</Opacity>{}</Category>",
+            escape_xml(&self.name), escape_xml(&self.color_string), self.allow_open_all,
+            shortcuts, self.width, self.opacity, icon
         )
     }
 
@@ -110,6 +116,17 @@ impl Category {
                 .parse()
                 .map_err(|_| XmlError::InvalidValue("Opacity"))?;
         }
+        if let Some(path) = optional_text(xml, "IconPath")? {
+            let index = optional_text(xml, "IconIndex")?
+                .map(|value| {
+                    value
+                        .parse()
+                        .map_err(|_| XmlError::InvalidValue("IconIndex"))
+                })
+                .transpose()?
+                .unwrap_or(0);
+            category.icon_source = Some(GroupIconSource { path, index });
+        }
         if let Some(shortcut_list) = raw_element_text(xml, "ShortcutList")? {
             let mut remaining = shortcut_list.as_str();
             while let Some(start) = remaining.find("<ProgramShortcut>") {
@@ -125,6 +142,12 @@ impl Category {
         }
         Ok(category)
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GroupIconSource {
+    pub path: String,
+    pub index: i32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
