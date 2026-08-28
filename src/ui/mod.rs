@@ -5,6 +5,7 @@
 //! then render `View`; it should not contain business-flow decisions.
 
 mod shell;
+mod windows;
 
 use std::{fs, io};
 
@@ -15,6 +16,7 @@ use crate::{
 };
 
 pub use shell::{TemporaryShell, UiShell};
+pub use windows::{action_for_event, NativeEvent};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Screen {
@@ -389,18 +391,26 @@ impl<S: UiShell> Controller<S> {
 }
 
 pub fn run(request: LaunchRequest, paths: AppPaths) -> io::Result<()> {
-    let mut controller = Controller::new(request, paths, TemporaryShell);
-    if controller.view.screen == Screen::Configuration {
-        controller.dispatch(Action::ReloadGroups);
-        controller
-            .shell_mut()
-            .show_message("Taskbar Groups configuration mode");
-    } else {
-        controller
-            .shell_mut()
-            .show_message("Taskbar Groups group launcher mode");
+    #[cfg(windows)]
+    {
+        return windows::run(request, paths);
     }
-    Ok(())
+
+    #[cfg(not(windows))]
+    {
+        let mut controller = Controller::new(request, paths, TemporaryShell);
+        if controller.view.screen == Screen::Configuration {
+            controller.dispatch(Action::ReloadGroups);
+            controller
+                .shell_mut()
+                .show_message("Taskbar Groups configuration mode");
+        } else {
+            controller
+                .shell_mut()
+                .show_message("Taskbar Groups group launcher mode");
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
