@@ -274,6 +274,7 @@ impl std::error::Error for LaunchError {}
 
 pub mod icon_cache;
 pub mod shell_link;
+pub mod special_targets;
 pub mod windows_apps;
 
 #[cfg(windows)]

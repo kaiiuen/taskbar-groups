@@ -3,8 +3,8 @@
 use std::{io, os::windows::process::CommandExt, process::Command, ptr};
 
 use super::{
-    LaunchError, LaunchSpec, Launcher, PassthroughResolver, ResolveError, ResolvedTarget,
-    ShortcutResolver,
+    special_targets, LaunchError, LaunchSpec, Launcher, PassthroughResolver, ResolveError,
+    ResolvedTarget, ShortcutResolver,
 };
 use crate::domain::ProgramShortcut;
 
@@ -32,8 +32,37 @@ impl ShortcutResolver for WindowsPlatform {
     }
 }
 
-impl Launcher for WindowsPlatform {
-    fn launch(&self, spec: &LaunchSpec) -> Result<(), LaunchError> {
+impl WindowsPlatform {
+    /// Launch with an explicit elevation policy. The regular `Launcher` API uses
+    /// `Never`, so existing callers cannot accidentally trigger UAC.
+    pub fn launch_with_policy(
+        &self,
+        spec: &LaunchSpec,
+        elevation: special_targets::ElevationPolicy,
+    ) -> Result<(), LaunchError> {
+        if let ResolvedTarget::Path { path, .. } = &spec.target {
+            if let Some(plan) =
+                special_targets::plan(path, &spec.arguments, &spec.working_directory, elevation)
+                    .map_err(|error| LaunchError::InvalidTarget {
+                        target: path.clone(),
+                        reason: error.to_string(),
+                    })?
+            {
+                return special_targets::launch_windows(&plan);
+            }
+        }
+        if elevation == special_targets::ElevationPolicy::RunAs {
+            return special_targets::launch_windows_target(
+                &target_string(&spec.target),
+                &spec.arguments,
+                &spec.working_directory,
+                elevation,
+            );
+        }
+        self.launch_default(spec)
+    }
+
+    fn launch_default(&self, spec: &LaunchSpec) -> Result<(), LaunchError> {
         match &spec.target {
             ResolvedTarget::WindowsApp { app_user_model_id } => {
                 let target = format!("shell:AppsFolder\\{app_user_model_id}");
@@ -45,6 +74,21 @@ impl Launcher for WindowsPlatform {
             ResolvedTarget::Path { path, .. } => {
                 shell_launch(path, &spec.arguments, &spec.working_directory)
             }
+        }
+    }
+}
+
+impl Launcher for WindowsPlatform {
+    fn launch(&self, spec: &LaunchSpec) -> Result<(), LaunchError> {
+        self.launch_with_policy(spec, special_targets::ElevationPolicy::Never)
+    }
+}
+
+fn target_string(target: &ResolvedTarget) -> String {
+    match target {
+        ResolvedTarget::Path { path, .. } => path.clone(),
+        ResolvedTarget::WindowsApp { app_user_model_id } => {
+            format!("shell:AppsFolder\\{app_user_model_id}")
         }
     }
 }
