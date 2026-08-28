@@ -70,14 +70,19 @@ mod native {
         platform::{LaunchRequest, LaunchSpec, Launcher, WindowsPlatform},
         ui::{Controller, UiShell},
     };
-    use std::{io, os::windows::ffi::OsStrExt, ptr};
+    use std::{
+        io,
+        os::windows::ffi::OsStrExt,
+        path::{Path, PathBuf},
+        ptr,
+    };
     use windows_sys::Win32::{
         Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM},
         Graphics::Gdi::COLOR_WINDOW,
         System::LibraryLoader::GetModuleHandleW,
         UI::{
             Input::KeyboardAndMouse::{GetKeyState, VK_RETURN},
-            Shell::ShellExecuteW,
+            Shell::{DragAcceptFiles, DragFinish, DragQueryFileW, ShellExecuteW, HDROP},
             WindowsAndMessaging::*,
         },
     };
@@ -93,6 +98,10 @@ mod native {
     const NEW: i32 = 108;
     const EDIT: i32 = 109;
     const ADD: i32 = 110;
+    const BROWSE_FILES: i32 = 122;
+    const BROWSE_FOLDER: i32 = 123;
+    const IMPORT_FILES: i32 = 124;
+    const BROWSE_ICON: i32 = 125;
     const REMOVE: i32 = 111;
     const UP: i32 = 112;
     const DOWN: i32 = 113;
@@ -107,6 +116,57 @@ mod native {
     const VK_CONTROL_KEY: i32 = 0x11;
     const BST_UNCHECKED_VALUE: usize = 0;
     const BST_CHECKED_VALUE: usize = 1;
+    const OFN_EXPLORER: u32 = 0x0008_0000;
+    const OFN_FILEMUSTEXIST: u32 = 0x0000_1000;
+    const OFN_ALLOWMULTISELECT: u32 = 0x0000_0200;
+    const BIF_RETURNONLYFSDIRS: u32 = 0x0001;
+
+    #[repr(C)]
+    struct OpenFileNameW {
+        l_struct_size: u32,
+        hwnd_owner: HWND,
+        h_instance: isize,
+        filter: *const u16,
+        custom_filter: *mut u16,
+        max_cust_filter: u32,
+        filter_index: u32,
+        file: *mut u16,
+        max_file: u32,
+        file_title: *mut u16,
+        max_file_title: u32,
+        initial_dir: *const u16,
+        title: *const u16,
+        flags: u32,
+        file_offset: u16,
+        file_extension: u16,
+        def_ext: *const u16,
+        cust_data: LPARAM,
+        hook: isize,
+        template_name: *const u16,
+        reserved: *const u16,
+        reserved2: u32,
+        flags_ex: u32,
+    }
+
+    #[repr(C)]
+    struct BrowseInfoW {
+        hwnd_owner: HWND,
+        pidl_root: *mut core::ffi::c_void,
+        display_name: *mut u16,
+        title: *const u16,
+        flags: u32,
+        callback: isize,
+        callback_data: LPARAM,
+        image: i32,
+    }
+
+    #[link(name = "comdlg32")]
+    #[link(name = "shell32")]
+    unsafe extern "system" {
+        fn GetOpenFileNameW(file_name: *mut OpenFileNameW) -> i32;
+        fn SHBrowseForFolderW(info: *const BrowseInfoW) -> *mut core::ffi::c_void;
+        fn SHGetPathFromIDListW(item_id_list: *const core::ffi::c_void, path: *mut u16) -> i32;
+    }
 
     struct NativeShell(HWND);
     impl UiShell for NativeShell {
@@ -138,6 +198,7 @@ mod native {
 
     struct NativeUi {
         controller: Controller<NativeShell>,
+        hwnd: HWND,
         groups: HWND,
         group_name: HWND,
         icon: HWND,
@@ -252,7 +313,11 @@ mod native {
         button(hwnd, "New group", 16, 12, 110, 24, NEW);
         button(hwnd, "Edit selected", 136, 12, 110, 24, EDIT);
         button(hwnd, "Add shortcut", 290, 455, 110, 26, ADD);
+        button(hwnd, "Browse files", 290, 428, 110, 24, BROWSE_FILES);
+        button(hwnd, "Browse folder", 410, 428, 110, 24, BROWSE_FOLDER);
+        button(hwnd, "Import files", 530, 428, 110, 24, IMPORT_FILES);
         button(hwnd, "Remove", 410, 455, 90, 26, REMOVE);
+        button(hwnd, "Browse icon", 690, 68, 110, 24, BROWSE_ICON);
         button(hwnd, "Move up", 510, 455, 90, 26, UP);
         button(hwnd, "Move down", 610, 455, 90, 26, DOWN);
         button(hwnd, "Save", 290, 500, 90, 26, SAVE);
@@ -261,6 +326,7 @@ mod native {
         button(hwnd, "Launch all", 590, 500, 100, 26, LAUNCH);
         NativeUi {
             controller,
+            hwnd,
             groups,
             group_name,
             icon,
@@ -351,6 +417,17 @@ mod native {
         _lparam: LPARAM,
     ) -> LRESULT {
         match message {
+            WM_CREATE => {
+                DragAcceptFiles(hwnd, 1);
+                0
+            }
+            WM_DROPFILES => {
+                if let Some(ui) = (GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut NativeUi).as_mut()
+                {
+                    drop_files(ui, wparam as HDROP);
+                }
+                0
+            }
             WM_COMMAND => {
                 if let Some(ui) = (GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut NativeUi).as_mut()
                 {
@@ -437,9 +514,180 @@ mod native {
             _ => None,
         };
         if let Some(event) = event {
-            ui.controller.dispatch(action_for_event(event));
-            render(ui);
+            dispatch(ui, event);
+        } else if id == BROWSE_FILES || id == IMPORT_FILES {
+            if let Some(paths) = choose_files(ui.hwnd, id == IMPORT_FILES) {
+                for path in paths {
+                    dispatch(
+                        ui,
+                        NativeEvent::AddShortcut {
+                            path,
+                            is_windows_app: false,
+                        },
+                    );
+                }
+            }
+        } else if id == BROWSE_FOLDER {
+            if let Some(path) = choose_folder(ui.hwnd) {
+                dispatch(
+                    ui,
+                    NativeEvent::AddShortcut {
+                        path,
+                        is_windows_app: false,
+                    },
+                );
+            }
+        } else if id == BROWSE_ICON {
+            if let Some(path) = choose_files(ui.hwnd, false).and_then(|mut paths| paths.pop()) {
+                dispatch(ui, NativeEvent::Icon(path));
+            }
         }
+    }
+
+    fn dispatch(ui: &mut NativeUi, event: NativeEvent) {
+        ui.controller.dispatch(action_for_event(event));
+        render(ui);
+        if let Some(error) = ui.controller.view().error.as_ref() {
+            let message = error.to_string();
+            ui.controller.shell_mut().show_error(&message);
+        }
+    }
+
+    fn drop_files(ui: &mut NativeUi, drop: HDROP) {
+        let count = unsafe { DragQueryFileW(drop, 0xffff_ffff, ptr::null_mut(), 0) };
+        for index in 0..count {
+            let length = unsafe { DragQueryFileW(drop, index, ptr::null_mut(), 0) };
+            let mut value = vec![0u16; length as usize + 1];
+            unsafe { DragQueryFileW(drop, index, value.as_mut_ptr(), value.len() as u32) };
+            let path = String::from_utf16_lossy(&value[..length as usize]);
+            if valid_target(&path) {
+                dispatch(
+                    ui,
+                    NativeEvent::AddShortcut {
+                        path,
+                        is_windows_app: false,
+                    },
+                );
+            } else {
+                ui.controller
+                    .shell_mut()
+                    .show_error(&format!("Unsupported shortcut target: {path}"));
+            }
+        }
+        unsafe { DragFinish(drop) };
+    }
+
+    fn choose_files(ui: HWND, multi: bool) -> Option<Vec<String>> {
+        let mut buffer = vec![0u16; 32_768];
+        let filter =
+            wide("Programs and shortcuts\0*.exe;*.com;*.bat;*.cmd;*.lnk;*.url\0All files\0*.*\0\0");
+        let dialog_title = wide(if multi {
+            "Import shortcuts"
+        } else {
+            "Select a shortcut"
+        });
+        let mut dialog = OpenFileNameW {
+            l_struct_size: std::mem::size_of::<OpenFileNameW>() as u32,
+            hwnd_owner: ui,
+            h_instance: 0,
+            filter: filter.as_ptr(),
+            custom_filter: ptr::null_mut(),
+            max_cust_filter: 0,
+            filter_index: 1,
+            file: buffer.as_mut_ptr(),
+            max_file: buffer.len() as u32,
+            file_title: ptr::null_mut(),
+            max_file_title: 0,
+            initial_dir: ptr::null(),
+            title: dialog_title.as_ptr(),
+            flags: OFN_EXPLORER | OFN_FILEMUSTEXIST | if multi { OFN_ALLOWMULTISELECT } else { 0 },
+            file_offset: 0,
+            file_extension: 0,
+            def_ext: ptr::null(),
+            cust_data: 0,
+            hook: 0,
+            template_name: ptr::null(),
+            reserved: ptr::null(),
+            reserved2: 0,
+            flags_ex: 0,
+        };
+        if unsafe { GetOpenFileNameW(&mut dialog) } == 0 {
+            return None;
+        }
+        let values = nul_strings(&buffer);
+        let paths = if values.len() > 1 {
+            values[1..]
+                .iter()
+                .map(|name| {
+                    PathBuf::from(&values[0])
+                        .join(name)
+                        .to_string_lossy()
+                        .into_owned()
+                })
+                .collect()
+        } else {
+            values
+        };
+        let invalid = paths.iter().find(|path| !valid_target(path));
+        if let Some(path) = invalid {
+            message_box(
+                ui,
+                &format!("Unsupported shortcut target: {path}"),
+                MB_OK | MB_ICONERROR,
+            );
+            None
+        } else {
+            Some(paths)
+        }
+    }
+
+    fn choose_folder(ui: HWND) -> Option<String> {
+        let mut display = vec![0u16; 260];
+        let title = wide("Select a folder shortcut target");
+        let info = BrowseInfoW {
+            hwnd_owner: ui,
+            pidl_root: ptr::null_mut(),
+            display_name: display.as_mut_ptr(),
+            title: title.as_ptr(),
+            flags: BIF_RETURNONLYFSDIRS,
+            callback: 0,
+            callback_data: 0,
+            image: 0,
+        };
+        let pidl = unsafe { SHBrowseForFolderW(&info) };
+        if pidl.is_null() {
+            return None;
+        }
+        let mut path = vec![0u16; 32_768];
+        let selected = unsafe { SHGetPathFromIDListW(pidl, path.as_mut_ptr()) } != 0;
+        selected.then(|| {
+            String::from_utf16_lossy(
+                &path[..path.iter().position(|c| *c == 0).unwrap_or(path.len())],
+            )
+        })
+    }
+
+    fn nul_strings(buffer: &[u16]) -> Vec<String> {
+        buffer
+            .split(|value| *value == 0)
+            .take_while(|part| !part.is_empty())
+            .map(String::from_utf16_lossy)
+            .collect()
+    }
+
+    fn valid_target(path: &str) -> bool {
+        let path = Path::new(path);
+        if path.is_dir() {
+            return true;
+        }
+        path.is_file()
+            && matches!(
+                path.extension()
+                    .and_then(|ext| ext.to_str())
+                    .map(str::to_ascii_lowercase)
+                    .as_deref(),
+                Some("exe" | "com" | "bat" | "cmd" | "lnk" | "url")
+            )
     }
 
     fn selected_group(ui: &NativeUi) -> Option<String> {
@@ -629,6 +877,25 @@ mod tests {
         assert_eq!(
             action_for_event(NativeEvent::WorkingDirectory("C:\\Games".into())),
             Action::SetWorkingDirectory("C:\\Games".into())
+        );
+    }
+    #[test]
+    fn maps_native_file_workflows_to_existing_actions() {
+        assert_eq!(
+            action_for_event(NativeEvent::AddShortcut {
+                path: "C:\\Tools\\tool.exe".into(),
+                is_windows_app: false,
+            }),
+            Action::AddShortcut {
+                path: "C:\\Tools\\tool.exe".into(),
+                is_windows_app: false,
+            }
+        );
+        assert_eq!(
+            action_for_event(NativeEvent::Icon("C:\\Icons\\app.ico".into())),
+            Action::SetIcon {
+                path: "C:\\Icons\\app.ico".into()
+            }
         );
     }
 }
